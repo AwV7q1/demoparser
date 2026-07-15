@@ -98,6 +98,13 @@ impl<'a> SecondPassParser<'a> {
             }
         }
         if !events_to_emit.is_empty() {
+            // ADR-007 §VI.2 streaming prototype: detect round boundary directly off the raw
+            // events, BEFORE emit_events()'s wanted_events gating (create_custom_event_round_end
+            // no-ops unless the caller asked for "round_end"/"all" — this flag must not depend
+            // on that, since streaming mode collects props with wanted_events left empty).
+            if events_to_emit.iter().any(|e| matches!(e, GameEventInfo::RoundEnd(_))) {
+                self.round_boundary_hit = true;
+            }
             self.emit_events(events_to_emit)?;
         }
         Ok(())

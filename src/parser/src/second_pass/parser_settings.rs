@@ -77,6 +77,20 @@ pub struct SecondPassParser<'a> {
     pub last_tick: i32,
     pub parse_usercmd: bool,
     pub list_props: bool,
+    // Streaming prototype (ADR-007 §VI.2): set by entities.rs when a round_end prop-change is
+    // seen (ungated by wanted_events), consumed in parser.rs right after collect_entities() so
+    // the boundary tick's props are included in the departing round's chunk.
+    pub round_boundary_hit: bool,
+    pub round_flush: Option<Box<dyn FnMut(RoundFlushChunk)>>,
+}
+
+/// One round's worth of drained accumulator state, handed to the `round_flush` callback so the
+/// caller can encode+free it before the next round starts. Prototype-only (ADR-007 §VI.2) —
+/// not wired into the Node/Python/WASM bindings.
+pub struct RoundFlushChunk {
+    pub tick: i32,
+    pub output: AHashMap<u32, PropColumn, RandomState>,
+    pub game_events: Vec<GameEvent>,
 }
 #[derive(Debug, Clone)]
 pub struct Teams {
@@ -228,7 +242,16 @@ impl<'a> SecondPassParser<'a> {
             huffman_lookup_table: &first_pass_output.settings.huffman_lookup_table,
             header: HashMap::default(),
             list_props: first_pass_output.list_props,
+            round_boundary_hit: false,
+            round_flush: None,
         })
+    }
+
+    /// Register a callback invoked at each round boundary during `start()`, receiving the
+    /// accumulator drained so far (see [`RoundFlushChunk`]). Prototype-only (ADR-007 §VI.2).
+    pub fn with_round_flush(mut self, cb: Box<dyn FnMut(RoundFlushChunk)>) -> Self {
+        self.round_flush = Some(cb);
+        self
     }
 }
 

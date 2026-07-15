@@ -252,6 +252,22 @@ impl<'a> SecondPassParser<'a> {
                             let _ct = prof_on().then(std::time::Instant::now);
                             self.collect_entities();
                             if let Some(t) = _ct { PROF_COLLECT_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64)); }
+                            // ADR-007 §VI.2 streaming prototype: this tick's props are already in
+                            // self.output (collect_entities() above), so draining here includes the
+                            // round-end tick in the departing round's chunk.
+                            if self.round_boundary_hit {
+                                self.round_boundary_hit = false;
+                                if self.round_flush.is_some() {
+                                    let chunk = RoundFlushChunk {
+                                        tick: self.tick,
+                                        output: std::mem::take(&mut self.output),
+                                        game_events: std::mem::take(&mut self.game_events),
+                                    };
+                                    if let Some(cb) = self.round_flush.as_mut() {
+                                        cb(chunk);
+                                    }
+                                }
+                            }
                         }
                     }
                     Ok(())

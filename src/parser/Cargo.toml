@@ -3,6 +3,13 @@ name = "parser"
 version = "0.1.1"
 edition = "2021"
 
+# Pre-existing gap in the fork (unrelated to the ADR-007 streaming patch): src/node's
+# Cargo.toml depends on this crate with `features = ["voice"]`, but nothing here is actually
+# gated by cfg(feature = "voice") -- voice_data collection is unconditional. Empty stub so the
+# node crate's dependency resolves; not a behavior change.
+[features]
+voice = []
+
 [dependencies]
 bitter = "0.7.0"
 prost = "0.13.3"
@@ -26,6 +33,11 @@ bytes = "1.5.0"
 [dependencies.csgoproto]
 path = "../csgoproto"
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
+
+# Peak-working-set measurement for the ADR-007 §VI.2 streaming prototype bin only
+# (parse_stream_bench) -- not used by the library itself, doesn't affect Linux/macOS/prod builds.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_Foundation"] }
 
 [profile.dev]
 overflow-checks = false
