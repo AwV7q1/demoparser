@@ -14,6 +14,7 @@
 use crate::first_pass::prop_controller::PropInfo;
 use crate::second_pass::parser_settings::RoundFlushChunk;
 use crate::second_pass::variants::{PropColumn, Variant, VarVec};
+use crate::zstd_codec::compress;
 use ahash::HashMap;
 
 const NULL_U8: u8 = 255;
@@ -50,11 +51,17 @@ impl Dict {
 fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
   if v < lo { lo } else if v > hi { hi } else { v }
 }
+// JS Math.round semantics (round half toward +∞) -- Rust f64::round() rounds half AWAY from zero,
+// which diverges from replay-codec-core.ts at exact .5 values (esp. negative velocities). ALL
+// quantization must use this to stay byte-identical with the TS encoder.
+fn js_round(x: f64) -> f64 {
+  (x + 0.5).floor()
+}
 fn norm_angle(a: f64) -> f64 {
   (((a % 360.0) + 540.0) % 360.0) - 180.0
 }
 fn enc_angle(a: f64) -> u16 {
-  clamp(((norm_angle(a) + 180.0) * ANGLE_SCALE).round(), 0.0, 360.0 * ANGLE_SCALE) as u16
+  clamp(js_round((norm_angle(a) + 180.0) * ANGLE_SCALE), 0.0, 360.0 * ANGLE_SCALE) as u16
 }
 
 pub fn build_name_to_id(prop_infos: &[PropInfo]) -> HashMap<String, u32> {
@@ -172,6 +179,24 @@ pub fn encode_round_tick_body(chunk: &RoundFlushChunk, name_to_id: &HashMap<Stri
   if r == 0 {
     return vec![];
   }
+  let indices: Vec<usize> = (0..r).collect();
+  encode_rows(&chunk.output, name_to_id, &indices).0
+}
+
+/// Encode a SUBSET of rows (given by `indices`) from a columnar tick `output` -> (raw bytes
+/// pre-zstd, distinct player count). Byte-layout-identical to replay-codec-core.ts's
+/// encodeReplayChunkBody; offsets/dicts computed from ONLY the given rows (per-chunk, matches TS).
+/// Shared core behind both the streaming per-round path (encode_round_tick_body) and the bulk
+/// sampled path (build_replay_chunks).
+pub fn encode_rows(
+  output: &ahash::AHashMap<u32, PropColumn>,
+  name_to_id: &HashMap<String, u32>,
+  indices: &[usize],
+) -> (Vec<u8>, usize) {
+  let r = indices.len();
+  if r == 0 {
+    return (vec![], 0);
+  }
 
   let mut steam_list: Vec<String> = vec![];
   let mut steam_index: HashMap<String, u32> = HashMap::default();
@@ -186,8 +211,8 @@ pub fn encode_round_tick_body(chunk: &RoundFlushChunk, name_to_id: &HashMap<Stri
   let mut tick_start = i32::MAX;
   let mut tick_end = i32::MIN;
 
-  for i in 0..r {
-    let g = |name: &str| get_variant(&chunk.output, name_to_id, name, i);
+  for &i in indices {
+    let g = |name: &str| get_variant(output, name_to_id, name, i);
 
     // steamId: matches `g('steamid') || ''` -- U64 serializes as a JS STRING (not number), so
     // only true absence (None) falls back to '' -- a legit steamid of 0 stays "0", not "".
@@ -293,9 +318,9 @@ pub fn encode_round_tick_body(chunk: &RoundFlushChunk, name_to_id: &HashMap<Stri
     push_u8(&mut steam_id_idx_col, row.steamid_idx as u8);
     push_i32(&mut tick_col, row.tick);
 
-    let qx = (row.x - off_x).round();
-    let qy = (row.y - off_y).round();
-    let qz = (row.z - off_z).round();
+    let qx = js_round(row.x - off_x);
+    let qy = js_round(row.y - off_y);
+    let qz = js_round(row.z - off_z);
     push_u16(&mut x_col, qx as u16);
     push_u16(&mut y_col, qy as u16);
     push_u16(&mut z_col, qz as u16);
@@ -311,18 +336,18 @@ pub fn encode_round_tick_body(chunk: &RoundFlushChunk, name_to_id: &HashMap<Stri
       | ((row.is_walking as u8) << 5);
     push_u8(&mut flags_col, flags);
     push_u8(&mut side_col, row.side);
-    push_u8(&mut health_col, match row.health { None => NULL_U8, Some(h) => clamp(h.round(), 0.0, 254.0) as u8 });
-    push_u8(&mut armor_col, match row.armor { None => NULL_U8, Some(a) => clamp(a.round(), 0.0, 254.0) as u8 });
+    push_u8(&mut health_col, match row.health { None => NULL_U8, Some(h) => clamp(js_round(h), 0.0, 254.0) as u8 });
+    push_u8(&mut armor_col, match row.armor { None => NULL_U8, Some(a) => clamp(js_round(a), 0.0, 254.0) as u8 });
     push_u16(&mut weapon_id_col, row.weapon_id as u16);
-    push_u16(&mut ammo_col, match row.ammo { None => NULL_U16, Some(a) => clamp(a.round(), 0.0, 65534.0) as u16 });
-    push_u16(&mut money_col, match row.money { None => NULL_U16, Some(m) => clamp(m.round(), 0.0, 65534.0) as u16 });
-    push_u16(&mut equip_col, match row.equip { None => NULL_U16, Some(e) => clamp(e.round(), 0.0, 65534.0) as u16 });
+    push_u16(&mut ammo_col, match row.ammo { None => NULL_U16, Some(a) => clamp(js_round(a), 0.0, 65534.0) as u16 });
+    push_u16(&mut money_col, match row.money { None => NULL_U16, Some(m) => clamp(js_round(m), 0.0, 65534.0) as u16 });
+    push_u16(&mut equip_col, match row.equip { None => NULL_U16, Some(e) => clamp(js_round(e), 0.0, 65534.0) as u16 });
     push_u16(&mut place_id_col, row.place_id as u16);
-    push_u16(&mut flash_col, match row.flash { None => NULL_U16, Some(f) => clamp((f * 1000.0).round(), 0.0, 65534.0) as u16 });
-    push_i32(&mut vel_x_col, match row.vel_x { None => NULL_I32, Some(v) => clamp(v.round(), -2147483647.0, 2147483647.0) as i32 });
-    push_i32(&mut vel_y_col, match row.vel_y { None => NULL_I32, Some(v) => clamp(v.round(), -2147483647.0, 2147483647.0) as i32 });
-    push_i32(&mut vel_z_col, match row.vel_z { None => NULL_I32, Some(v) => clamp(v.round(), -2147483647.0, 2147483647.0) as i32 });
-    push_u16(&mut duck_col, match row.duck { None => NULL_U16, Some(d) => clamp((d * 1000.0).round(), 0.0, 65534.0) as u16 });
+    push_u16(&mut flash_col, match row.flash { None => NULL_U16, Some(f) => clamp(js_round(f * 1000.0), 0.0, 65534.0) as u16 });
+    push_i32(&mut vel_x_col, match row.vel_x { None => NULL_I32, Some(v) => clamp(js_round(v), -2147483647.0, 2147483647.0) as i32 });
+    push_i32(&mut vel_y_col, match row.vel_y { None => NULL_I32, Some(v) => clamp(js_round(v), -2147483647.0, 2147483647.0) as i32 });
+    push_i32(&mut vel_z_col, match row.vel_z { None => NULL_I32, Some(v) => clamp(js_round(v), -2147483647.0, 2147483647.0) as i32 });
+    push_u16(&mut duck_col, match row.duck { None => NULL_U16, Some(d) => clamp(js_round(d * 1000.0), 0.0, 65534.0) as u16 });
 
     let inv_n = row.inv.len().min(255);
     push_u8(&mut inv_count_col, inv_n as u8);
@@ -331,19 +356,45 @@ pub fn encode_round_tick_body(chunk: &RoundFlushChunk, name_to_id: &HashMap<Stri
     }
   }
 
-  // ---- header JSON (field names/values must match replay-codec-core.ts; key ORDER doesn't
-  // matter -- the TS decoder reads header.r/header.steamIds/etc by name, not position) ----
-  let header = serde_json::json!({
-    "r": r,
-    "sampleStep": 8,
-    "tickStart": if tick_start == i32::MAX { 0 } else { tick_start },
-    "tickEnd": if tick_end == i32::MIN { 0 } else { tick_end },
-    "offX": off_x, "offY": off_y, "offZ": off_z,
-    "steamIds": steam_list,
-    "weapons": weapon.list,
-    "places": place.list,
-    "items": item.list,
-  });
+  // ---- header JSON. Field ORDER must match replay-codec-core.ts's `header` object literal exactly
+  // for byte-identity (serde_json::json! uses a BTreeMap → alphabetical, which would diverge). A
+  // derived struct serializes fields in DECLARATION order. off* emitted as integers (floor()'d, so
+  // whole) to match JS JSON.stringify(-640) vs serde's f64 "-640.0". ----
+  #[derive(serde::Serialize)]
+  struct ChunkHeader {
+    r: usize,
+    #[serde(rename = "sampleStep")]
+    sample_step: u32,
+    #[serde(rename = "tickStart")]
+    tick_start: i32,
+    #[serde(rename = "tickEnd")]
+    tick_end: i32,
+    #[serde(rename = "offX")]
+    off_x: i64,
+    #[serde(rename = "offY")]
+    off_y: i64,
+    #[serde(rename = "offZ")]
+    off_z: i64,
+    #[serde(rename = "steamIds")]
+    steam_ids: Vec<String>,
+    weapons: Vec<String>,
+    places: Vec<String>,
+    items: Vec<String>,
+  }
+  let player_count = steam_list.len();
+  let header = ChunkHeader {
+    r,
+    sample_step: 8,
+    tick_start: if tick_start == i32::MAX { 0 } else { tick_start },
+    tick_end: if tick_end == i32::MIN { 0 } else { tick_end },
+    off_x: off_x as i64,
+    off_y: off_y as i64,
+    off_z: off_z as i64,
+    steam_ids: steam_list,
+    weapons: weapon.list,
+    places: place.list,
+    items: item.list,
+  };
   let header_json = serde_json::to_vec(&header).unwrap_or_default();
 
   let mut out = Vec::with_capacity(4 + 1 + 4 + header_json.len() + r * 30);
@@ -379,5 +430,87 @@ pub fn encode_round_tick_body(chunk: &RoundFlushChunk, name_to_id: &HashMap<Stri
     out.extend_from_slice(&v.to_le_bytes());
   }
 
-  out
+  (out, player_count)
+}
+
+// ── Bulk sampled replay chunks (ADR-007 Giai đoạn 3) ───────────────────────────
+/// One round's encoded + zstd-compressed replay tick blob + metadata, matching
+/// packages/parse-core buildReplayChunks() output (ParsedReplayChunk).
+pub struct ReplayChunkParsed {
+  pub round_number: i64,
+  pub tick_start: i64,
+  pub tick_end: i64,
+  pub sample_step: i64,
+  pub player_count: i64,
+  pub data: Vec<u8>,
+}
+
+/// Port of compute.ts buildReplayChunks(tickRows, rounds): group the bulk SAMPLED tick columns by
+/// round (binary search on sorted [startTick,endTick]) then encode + zstd each round. `rounds` is
+/// (round_number, start_tick, end_tick) in the ORIGINAL rounds order (output preserves that order).
+/// Empty rounds are skipped (matches TS). Per-round dicts/offsets fall out of encode_rows.
+pub fn build_replay_chunks(
+  df: &ahash::AHashMap<u32, PropColumn>,
+  prop_infos: &[PropInfo],
+  rounds: &[(i64, i64, i64)],
+  sample_step: i64,
+  zstd_level: i32,
+) -> std::io::Result<Vec<ReplayChunkParsed>> {
+  let name_to_id = build_name_to_id(prop_infos);
+  let tick_id = match name_to_id.get("tick") {
+    Some(id) => *id,
+    None => return Ok(vec![]),
+  };
+  let r = df.get(&tick_id).map(|c| c.len()).unwrap_or(0);
+  if r == 0 || rounds.is_empty() {
+    return Ok(vec![]);
+  }
+
+  // sorted ranges (by startTick) for binary search, same as TS buildReplayChunks.
+  let mut ranges: Vec<(i64, i64, i64)> = rounds.to_vec();
+  ranges.sort_by_key(|x| x.1);
+
+  let mut by_round: HashMap<i64, Vec<usize>> = HashMap::default();
+  for &(n, _, _) in &ranges {
+    by_round.insert(n, Vec::new());
+  }
+
+  for i in 0..r {
+    let t = as_f64(&get_variant(df, &name_to_id, "tick", i)).unwrap_or(0.0) as i64;
+    // largest idx with ranges[idx].start <= t
+    let (mut lo, mut hi, mut found): (isize, isize, isize) = (0, ranges.len() as isize - 1, -1);
+    while lo <= hi {
+      let mid = ((lo + hi) / 2) as usize;
+      if ranges[mid].1 <= t {
+        found = mid as isize;
+        lo = mid as isize + 1;
+      } else {
+        hi = mid as isize - 1;
+      }
+    }
+    if found >= 0 && t <= ranges[found as usize].2 {
+      if let Some(v) = by_round.get_mut(&ranges[found as usize].0) {
+        v.push(i);
+      }
+    }
+  }
+
+  let mut out = Vec::new();
+  for &(n, s, e) in rounds {
+    let indices = match by_round.get(&n) {
+      Some(v) if !v.is_empty() => v,
+      _ => continue,
+    };
+    let (bytes, player_count) = encode_rows(df, &name_to_id, indices);
+    let compressed = compress(&bytes, zstd_level)?;
+    out.push(ReplayChunkParsed {
+      round_number: n,
+      tick_start: s,
+      tick_end: e,
+      sample_step,
+      player_count: player_count as i64,
+      data: compressed,
+    });
+  }
+  Ok(out)
 }

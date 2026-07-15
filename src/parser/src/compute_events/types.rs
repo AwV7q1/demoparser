@@ -161,9 +161,12 @@ pub struct ParsedEvent<D: Serialize> {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KillData {
-  #[serde(skip_serializing_if = "Option::is_none", default)]
+  // NO skip_serializing_if: demoparser2 always includes attacker_* keys (as null on world/bomb
+  // kills), and TS buildKills passes them through -> must emit `null`, not omit. `default` kept for
+  // deserialize robustness. (ADR-007 Giai đoạn 3: caught by parity on community demos with bomb kills.)
+  #[serde(default)]
   pub attacker_name: Option<Value>,
-  #[serde(skip_serializing_if = "Option::is_none", default)]
+  #[serde(default)]
   pub attacker_steam_id: Option<String>,
   pub attacker_side: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -185,13 +188,15 @@ pub struct KillData {
   pub attacker_blind: bool,
   pub suicide: bool,
   pub distance: Option<f64>,
-  #[serde(skip_serializing_if = "Option::is_none", default)]
+  // x/y (victim pos) are always present in a kill; attacker_x/y go null on world/bomb kills and TS
+  // emits them as null -> no skip (same reasoning as attacker_name above).
+  #[serde(default)]
   pub x: Option<f64>,
-  #[serde(skip_serializing_if = "Option::is_none", default)]
+  #[serde(default)]
   pub y: Option<f64>,
-  #[serde(skip_serializing_if = "Option::is_none", default)]
+  #[serde(default)]
   pub attacker_x: Option<f64>,
-  #[serde(skip_serializing_if = "Option::is_none", default)]
+  #[serde(default)]
   pub attacker_y: Option<f64>,
 }
 

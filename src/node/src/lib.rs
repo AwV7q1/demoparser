@@ -648,6 +648,59 @@ pub fn parse_ticks_force_st(
   Ok(s)
 }
 
+/// ADR-007 Giai đoạn 3 parity-debug ONLY: like `parse_ticks` but forces
+/// `ParsingMode::ForceSingleThreaded` AND honors `wanted_ticks` (the sampled subset). Mirrors the
+/// full-pipeline's internal `run_parse_ticks_raw` exactly, so a TS `computeMatchData` baseline can
+/// be fed the SAME ST sampled ticks the Rust pipeline uses -> replay-chunk/stats parity is
+/// apples-to-apples (not ST-pipeline vs MT-default-bulk). Prop_infos sorted by prop_name to match.
+#[napi]
+pub fn parse_ticks_sampled_st(
+  path_or_buf: Either<String, Buffer>,
+  wanted_props: Vec<String>,
+  wanted_ticks: Vec<i32>,
+  struct_of_arrays: Option<bool>,
+) -> napi::Result<Value> {
+  let real_names = match rm_user_friendly_names(&wanted_props) {
+    Ok(names) => names,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+  };
+  let bytes = resolve_byte_type(path_or_buf)?;
+  let huf = create_huffman_lookup_table();
+  let mut real_name_to_og_name = AHashMap::default();
+  for (real_name, user_friendly_name) in real_names.iter().zip(&wanted_props) {
+    real_name_to_og_name.insert(real_name.clone(), user_friendly_name.clone());
+  }
+  let settings = ParserInputs {
+    real_name_to_og_name,
+    wanted_players: vec![],
+    wanted_player_props: real_names.clone(),
+    wanted_other_props: vec![],
+    wanted_events: vec![],
+    wanted_prop_states: AHashMap::default(),
+    parse_ents: true,
+    wanted_ticks,
+    parse_projectiles: false,
+    only_header: false,
+    list_props: false,
+    only_convars: false,
+    huffman_lookup_table: &huf,
+    order_by_steamid: false,
+    fallback_bytes: None,
+    parse_grenades: false,
+  };
+  let mut parser = Parser::new(settings, parser::parse_demo::ParsingMode::ForceSingleThreaded);
+  let output = parse_demo(bytes, &mut parser)?;
+  let mut prop_infos = output.prop_controller.prop_infos.clone();
+  prop_infos.sort_by_key(|x| x.prop_name.clone());
+  let helper = OutputSerdeHelperStruct { prop_infos, inner: output.df.clone().into() };
+  let result = if struct_of_arrays.unwrap_or(false) {
+    serde_json::to_value(&helper)
+  } else {
+    serde_json::to_value(&soa_to_aos(helper))
+  };
+  result.map_err(|e| Error::new(Status::InvalidArg, format!("{}", e).to_owned()))
+}
+
 /// ADR-007 §VI.2 streaming prototype (cs2-analytics): per-round variant of `parse_ticks`.
 /// Instead of returning one bulk result, invokes `callback` once per round with
 /// `{ tick, rows, events, bytes }` -- `bytes` is that round's actual columnar prop data

@@ -23,12 +23,14 @@ use ahash::AHashMap;
 use memmap2::MmapOptions;
 use napi::bindgen_prelude::*;
 use napi::Error;
-use napi::JsUnknown;
+use napi::JsObject;
 use napi::Status;
-use parser::first_pass::parser_settings::{rm_user_friendly_names, ParserInputs};
+use parser::first_pass::parser_settings::{rm_user_friendly_names, FirstPassParser, ParserInputs};
+use parser::first_pass::prop_controller::PropInfo;
 use parser::parse_demo::{Parser, ParsingMode};
 use parser::second_pass::parser_settings::create_huffman_lookup_table;
-use parser::second_pass::variants::{soa_to_aos, OutputSerdeHelperStruct};
+use parser::second_pass::variants::{soa_to_aos, OutputSerdeHelperStruct, PropColumn};
+use parser::tick_codec::{build_replay_chunks, ReplayChunkParsed};
 use serde_json::Value;
 use std::fs::File;
 
@@ -162,7 +164,11 @@ fn run_parse_ticks(path: &str, wanted_props: Vec<String>, wanted_ticks: Vec<i32>
     fallback_bytes: None,
     parse_grenades: false,
   };
-  let mut parser = Parser::new(settings, ParsingMode::Normal);
+  // ForceSingleThreaded: ADR-007 gotcha #1 (§VI.2f) -- ParsingMode::Normal picks multi-threaded for
+  // this prop set, splitting the demo into segments each with its own history buffer -> velocity
+  // props go null/0 at segment boundaries, diverging from the ST baseline all parity was verified
+  // against. ST keeps continuous history, so replay/aim ticks stay byte-identical with parity.
+  let mut parser = Parser::new(settings, ParsingMode::ForceSingleThreaded);
   let output = parser.parse_demo(&mmap).map_err(io_err)?;
 
   let mut prop_infos = output.prop_controller.prop_infos.clone();
@@ -175,6 +181,68 @@ fn run_parse_ticks(path: &str, wanted_props: Vec<String>, wanted_ticks: Vec<i32>
     let result = soa_to_aos(helper);
     serde_json::to_value(&result).map_err(io_err)
   }
+}
+
+/// Header-only parse for `meta` (map/tickrate) -- mirrors lib.rs parse_header (FirstPassParser::
+/// parse_header_only), runnable on the Task background thread (no Env).
+fn run_parse_header(path: &str) -> napi::Result<AHashMap<String, String>> {
+  let mmap = mmap_path(path)?;
+  let huf = create_huffman_lookup_table();
+  let settings = ParserInputs {
+    real_name_to_og_name: AHashMap::default(),
+    wanted_players: vec![],
+    wanted_player_props: vec![],
+    wanted_other_props: vec![],
+    wanted_prop_states: AHashMap::default(),
+    wanted_events: vec![],
+    parse_ents: false,
+    wanted_ticks: vec![],
+    parse_projectiles: false,
+    only_header: true,
+    list_props: false,
+    only_convars: false,
+    huffman_lookup_table: &huf,
+    order_by_steamid: false,
+    fallback_bytes: None,
+    parse_grenades: false,
+  };
+  let mut parser = FirstPassParser::new(&settings);
+  parser.parse_header_only(&mmap).map_err(io_err)
+}
+
+/// Sampled-tick parse returning the RAW columnar df + prop_infos (not JSON). Lets us both build
+/// replay chunks (encode straight from columns, no re-normalize) AND serialize to SoA JSON for
+/// compute_stats -- from ONE parse. ForceSingleThreaded, same velocity-parity reason as above.
+fn run_parse_ticks_raw(path: &str, wanted_props: Vec<String>, wanted_ticks: Vec<i32>) -> napi::Result<(AHashMap<u32, PropColumn>, Vec<PropInfo>)> {
+  let real_names = rm_user_friendly_names(&wanted_props).map_err(io_err)?;
+  let mut real_name_to_og_name = AHashMap::default();
+  for (real_name, og) in real_names.iter().zip(&wanted_props) {
+    real_name_to_og_name.insert(real_name.clone(), og.clone());
+  }
+
+  let mmap = mmap_path(path)?;
+  let huf = create_huffman_lookup_table();
+  let settings = ParserInputs {
+    real_name_to_og_name,
+    wanted_players: vec![],
+    wanted_player_props: real_names.clone(),
+    wanted_other_props: vec![],
+    wanted_events: vec![],
+    wanted_prop_states: AHashMap::default(),
+    parse_ents: true,
+    wanted_ticks,
+    parse_projectiles: false,
+    only_header: false,
+    list_props: false,
+    only_convars: false,
+    huffman_lookup_table: &huf,
+    order_by_steamid: false,
+    fallback_bytes: None,
+    parse_grenades: false,
+  };
+  let mut parser = Parser::new(settings, ParsingMode::ForceSingleThreaded);
+  let output = parser.parse_demo(&mmap).map_err(io_err)?;
+  Ok((output.df, output.prop_controller.prop_infos))
 }
 
 // -- constants (subset, y hệt packages/parse-core/src/constants.ts / prototypes bench.mjs) --
@@ -218,17 +286,28 @@ const AIM_PREAIM_WINDOW: i64 = 64;
 pub struct FullPipelineTask {
   path: String,
   zstd_level: i32,
+  max_demo_ticks: i64,
 }
 
 impl FullPipelineTask {
-  pub fn new(path: String, zstd_level: i32) -> Self {
-    Self { path, zstd_level }
+  pub fn new(path: String, zstd_level: i32, max_demo_ticks: i64) -> Self {
+    Self { path, zstd_level, max_demo_ticks }
   }
 }
 
+/// Task::Output -- everything the ParsedMatch needs. Plain fields go through `json` (serde ->
+/// JsUnknown on the main thread); the two chunk families carry raw compressed bytes that must
+/// cross N-API as `Buffer` (not a serde array of numbers), so they're kept out of `json` and
+/// assembled into the object in resolve() where an `Env` is available.
+pub struct FullPipelineOutput {
+  json: Value,
+  replay_chunks: Vec<ReplayChunkParsed>,
+  replay_event_chunks: Vec<parser::compute_events::ReplayEventChunkOut>,
+}
+
 impl Task for FullPipelineTask {
-  type Output = Value;
-  type JsValue = JsUnknown;
+  type Output = FullPipelineOutput;
+  type JsValue = JsObject;
 
   // Chạy trên thread nền của napi (libuv threadpool) -- KHÔNG có Env, không đụng JS/V8. Đây là
   // toàn bộ lý do hàm này không chặn main thread: mọi việc nặng (đọc/giải mã demo + tính domain
@@ -254,7 +333,7 @@ impl Task for FullPipelineTask {
     // 2) computeEvents (pure Rust, không qua N-API JSON round-trip -- deserialize thẳng Value đã có).
     let events_in: Vec<parser::compute_events::RawEvent> = serde_json::from_value(raw_events_val).map_err(io_err)?;
     let grenade_in: Vec<parser::compute_events::RawGrenadeSample> = serde_json::from_value(grenade_rows_val).map_err(io_err)?;
-    let events_result = parser::compute_events::compute_events(&events_in, &grenade_in, self.zstd_level);
+    let mut events_result = parser::compute_events::compute_events(&events_in, &grenade_in, self.zstd_level);
 
     let kills_batch: Vec<parser::compute_stats::KillsBatchItem> = events_result
       .events.iter()
@@ -296,7 +375,7 @@ impl Task for FullPipelineTask {
       }
     }
 
-    // 3) tick data cho stats (SAMPLED_TICK_FIELDS, SoA) -- replicate wantedTicks compute.ts tự tính.
+    // 3) sampled tick data (SAMPLED_TICK_FIELDS) -- replicate wantedTicks compute.ts computes.
     let last_tick = round_end_ticks.iter().copied().max().unwrap_or(0).max(0);
     let mut wanted_ticks_i32: Vec<i32> = Vec::new();
     let mut t = 0i64;
@@ -304,7 +383,36 @@ impl Task for FullPipelineTask {
       wanted_ticks_i32.push(t as i32);
       t += PLAYER_TICK_SAMPLE_STEP;
     }
-    let tick_data_val = run_parse_ticks(&self.path, sampled_tick_fields(), wanted_ticks_i32, true)?;
+    // DemoTooLargeError guard (compute.ts:63) -- cap sampled tick count.
+    if (wanted_ticks_i32.len() as i64) > self.max_demo_ticks {
+      return Err(Error::new(
+        Status::GenericFailure,
+        format!("DemoTooLarge: {} sampled ticks > max {}", wanted_ticks_i32.len(), self.max_demo_ticks),
+      ));
+    }
+
+    // ONE ST sampled parse -> raw columnar df, feeding BOTH replay chunks (encode from columns) and
+    // compute_stats (SoA JSON). round tuples in ORIGINAL rounds order (build_replay_chunks output
+    // preserves it, matching compute.ts buildReplayChunks iterating `rounds`).
+    let (tick_df, tick_prop_infos) = run_parse_ticks_raw(&self.path, sampled_tick_fields(), wanted_ticks_i32)?;
+    let round_tuples: Vec<(i64, i64, i64)> =
+      events_result.rounds.iter().map(|r| (r.round_number, r.start_tick, r.end_tick)).collect();
+    let replay_chunks =
+      build_replay_chunks(&tick_df, &tick_prop_infos, &round_tuples, PLAYER_TICK_SAMPLE_STEP, self.zstd_level).map_err(io_err)?;
+
+    // SoA JSON for compute_stats (prop_infos sorted by prop_name, matching run_parse_ticks output
+    // shape parity was verified against). Moves tick_df (build_replay_chunks already done borrowing).
+    // ADR-007 §VI.2u lever ②: normalize NGAY trong scope này rồi để `helper` (bản df đã move) +
+    // `tick_data_val` (bản Value) DROP trước compute nặng — chỉ giữ lại `tick_rows` (9 field, nhỏ).
+    // Trước đây cả 2 bản to sống song song suốt compute_stats. Output byte-identical (cùng
+    // normalize_ticks mà wrapper compute_stats vẫn gọi).
+    let tick_rows = {
+      let mut sorted_prop_infos = tick_prop_infos.clone();
+      sorted_prop_infos.sort_by_key(|x| x.prop_name.clone());
+      let helper = OutputSerdeHelperStruct { prop_infos: sorted_prop_infos, inner: tick_df.into() };
+      let tick_data_val = serde_json::to_value(&helper).map_err(io_err)?;
+      parser::compute_stats::normalize_ticks(&tick_data_val)
+    };
 
     // 4) cửa sổ aim (AIM_TICK_FIELDS, AoS) -- tick quanh mỗi kill "engagement thật".
     let raw_kills_for_aim: Vec<parser::compute_aim::RawAimKillRow> =
@@ -322,12 +430,37 @@ impl Task for FullPipelineTask {
     let raw_hurt: Vec<parser::compute_stats::RawHurtRow> = serde_json::from_value(Value::Array(raw_hurt_arr)).map_err(io_err)?;
     let player_info: Vec<parser::compute_stats::RawPlayerInfo> = serde_json::from_value(player_info_val).map_err(io_err)?;
 
-    let stats_result = parser::compute_stats::compute_stats(
-      &kills_batch, &weapon_fire_batch, &hurt_batch, &raw_kills, &raw_hurt, &player_info, &tick_data_val, &events_result.rounds,
+    let stats_result = parser::compute_stats::compute_stats_rows(
+      &kills_batch, &weapon_fire_batch, &hurt_batch, &raw_kills, &raw_hurt, &player_info, &tick_rows, &events_result.rounds,
     );
     let aim_result = parser::compute_aim::compute_aim_stats(&raw_kills_for_aim, &weapon_fire_batch, &aim_tick_rows);
 
-    Ok(serde_json::json!({
+    // 6) meta (map/tickrate/duration) -- header parse. matchDate is NOT known to Rust (upload-time
+    // user choice) -> Node injects it into meta after the call. Mirrors compute.ts:70-72.
+    let header = run_parse_header(&self.path)?;
+    let map_name = match header.get("map_name") {
+      Some(m) if !m.is_empty() => m.clone(),
+      _ => "unknown".to_string(),
+    };
+    let tickrate_raw = header
+      .get("tickrate")
+      .or_else(|| header.get("tick_rate"))
+      .and_then(|s| s.parse::<f64>().ok())
+      .filter(|v| *v != 0.0)
+      .unwrap_or(64.0);
+    let mut tickrate = tickrate_raw.round() as i64;
+    if tickrate == 0 {
+      tickrate = 64;
+    }
+    let duration: Option<f64> = if last_tick > 0 {
+      format!("{:.1}", last_tick as f64 / tickrate as f64).parse::<f64>().ok()
+    } else {
+      None
+    };
+
+    let replay_event_chunks = std::mem::take(&mut events_result.replay_event_chunks);
+    let json = serde_json::json!({
+      "meta": { "map": map_name, "tickrate": tickrate, "duration": duration },
       "rounds": events_result.rounds,
       "events": events_result.events,
       "matchWeaponStats": stats_result.match_weapon_stats,
@@ -338,19 +471,54 @@ impl Task for FullPipelineTask {
       "roundEconomyStats": stats_result.round_economy_stats,
       "roundPlayerDamageStats": stats_result.round_player_damage_stats,
       "playerAimStats": aim_result,
-    }))
+    });
+    Ok(FullPipelineOutput { json, replay_chunks, replay_event_chunks })
   }
 
-  // Chạy lại trên main thread (có Env) -- `Task::JsValue` bắt buộc `ToNapiValue + TypeName`, mà
-  // `serde_json::Value` không impl `TypeName` (chỉ ToNapiValue, đủ cho return type thường nhưng
-  // không đủ cho Task) -- dùng `env.to_js_value` (napi serde-json feature) chuyển thẳng sang
-  // JsUnknown, tương đương serde_json::Value nhưng thoả được bound của Task.
+  // Main thread (has Env). Plain fields come across via serde; the two chunk arrays are built here
+  // so each chunk's `data` is a real `Buffer` (zero-copy Vec<u8> -> Buffer), matching
+  // ParsedReplayChunk/ParsedReplayEventChunk which persistParsedMatch writes as Bytes.
   fn resolve(&mut self, env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
-    env.to_js_value(&output)
+    let mut obj: JsObject = env.to_js_value(&output.json)?.coerce_to_object()?;
+
+    let mut rc = env.create_array_with_length(output.replay_chunks.len())?;
+    for (i, c) in output.replay_chunks.iter().enumerate() {
+      let mut o = env.create_object()?;
+      o.set("roundNumber", c.round_number)?;
+      o.set("format", 1i64)?;
+      o.set("tickStart", c.tick_start)?;
+      o.set("tickEnd", c.tick_end)?;
+      o.set("sampleStep", c.sample_step)?;
+      o.set("playerCount", c.player_count)?;
+      o.set("data", Buffer::from(c.data.clone()))?;
+      rc.set_element(i as u32, o)?;
+    }
+    obj.set("replayChunks", rc)?;
+
+    let mut ec = env.create_array_with_length(output.replay_event_chunks.len())?;
+    for (i, c) in output.replay_event_chunks.iter().enumerate() {
+      let mut o = env.create_object()?;
+      o.set("roundNumber", c.round_number)?;
+      o.set("format", c.format)?;
+      o.set("eventCount", c.event_count)?;
+      o.set("data", Buffer::from(c.data.clone()))?;
+      ec.set_element(i as u32, o)?;
+    }
+    obj.set("replayEventChunks", ec)?;
+
+    Ok(obj)
   }
 }
 
 #[napi]
-pub fn compute_full_pipeline_async(path: String, zstd_level: Option<i32>) -> AsyncTask<FullPipelineTask> {
-  AsyncTask::new(FullPipelineTask::new(path, zstd_level.unwrap_or(3)))
+pub fn compute_full_pipeline_async(
+  path: String,
+  zstd_level: Option<i32>,
+  max_demo_ticks: Option<i64>,
+) -> AsyncTask<FullPipelineTask> {
+  AsyncTask::new(FullPipelineTask::new(
+    path,
+    zstd_level.unwrap_or(3),
+    max_demo_ticks.unwrap_or(i64::MAX),
+  ))
 }
