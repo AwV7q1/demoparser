@@ -737,6 +737,106 @@ pub fn parse_ticks_streaming(
   Ok(serde_json::json!({ "tailRows": tail_rows, "tailEvents": tail_events }))
 }
 
+/// ADR-007 §VI.2 follow-up: does the ~150MB Node/V8 overhead go away if the round payload never
+/// crosses N-API as a `Buffer` at all? Same encode as `parse_ticks_streaming`, but each round's
+/// bytes are written straight to `out_path` from Rust (plain `std::fs::File`, appended); the JS
+/// callback -- still invoked once per round, since the round-boundary/manifest bookkeeping is
+/// the interesting part to keep -- only receives numbers (tick/rows/events/offset/len), never a
+/// Buffer. No `env.create_object()`+`Buffer::from()` per round, so nothing round-sized should be
+/// left for V8's GC to reclaim.
+#[napi]
+pub fn parse_ticks_streaming_to_file(
+  env: Env,
+  path_or_buf: Either<String, Buffer>,
+  wanted_props: Vec<String>,
+  out_path: String,
+  callback: JsFunction,
+) -> napi::Result<Value> {
+  use std::io::Write;
+
+  let real_names = match rm_user_friendly_names(&wanted_props) {
+    Ok(names) => names,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+  };
+  let mut real_name_to_og_name = AHashMap::default();
+  for (real_name, user_friendly_name) in real_names.iter().zip(&wanted_props) {
+    real_name_to_og_name.insert(real_name.clone(), user_friendly_name.clone());
+  }
+
+  let bytes = resolve_byte_type(path_or_buf)?;
+  let huf = create_huffman_lookup_table();
+
+  let settings = ParserInputs {
+    real_name_to_og_name,
+    wanted_players: vec![],
+    wanted_player_props: real_names.clone(),
+    wanted_other_props: vec![],
+    wanted_events: vec![],
+    wanted_prop_states: AHashMap::default(),
+    parse_ents: true,
+    wanted_ticks: vec![],
+    parse_projectiles: false,
+    only_header: false,
+    list_props: false,
+    only_convars: false,
+    huffman_lookup_table: &huf,
+    order_by_steamid: false,
+    fallback_bytes: None,
+    parse_grenades: false,
+  };
+
+  let mut first_pass_parser = FirstPassParser::new(&settings);
+  let first_pass_output = match first_pass_parser.parse_demo(&bytes[..], false) {
+    Ok(o) => o,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+  };
+  let prop_infos = first_pass_output.prop_controller.prop_infos.clone();
+  let name_to_id = parser::tick_codec::build_name_to_id(&prop_infos);
+
+  let mut out_file = match File::create(&out_path) {
+    Ok(f) => f,
+    Err(e) => return Err(Error::new(Status::GenericFailure, format!("create {out_path}: {e}"))),
+  };
+  // i64 is Copy, so a plain `let mut cursor` captured by a `move` closure would only hand the
+  // closure its own copy -- the outer binding would never see the closure's increments. Rc<Cell>
+  // shares the same cell instead, so the final read below sees the real total.
+  let cursor = std::rc::Rc::new(std::cell::Cell::new(0i64));
+  let cursor_cb = cursor.clone();
+
+  let cb: Box<dyn FnMut(RoundFlushChunk)> = Box::new(move |chunk: RoundFlushChunk| {
+    let rows: i64 = chunk.output.values().map(|c| c.len() as i64).sum();
+    let events = chunk.game_events.len() as i64;
+    let tick = chunk.tick;
+    let payload_bytes = parser::tick_codec::encode_round_tick_body(&chunk, &name_to_id);
+    let len = payload_bytes.len() as i64;
+    let offset = cursor_cb.get();
+    if out_file.write_all(&payload_bytes).is_ok() {
+      cursor_cb.set(offset + len);
+    }
+    // payload_bytes drops here -- plain Vec<u8>, never touched V8/N-API at all.
+    if let Ok(mut obj) = env.create_object() {
+      let _ = obj.set("tick", tick);
+      let _ = obj.set("rows", rows);
+      let _ = obj.set("events", events);
+      let _ = obj.set("offset", offset);
+      let _ = obj.set("len", len);
+      let _ = callback.call(None, &[obj.into_unknown()]);
+    }
+  });
+
+  let mut second_pass = match SecondPassParser::new(first_pass_output.clone(), 16, true, None) {
+    Ok(p) => p.with_round_flush(cb),
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+  };
+  if let Err(e) = second_pass.start(&bytes[..]) {
+    return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned()));
+  }
+
+  let tail_rows: i64 = second_pass.output.values().map(|c| c.len() as i64).sum();
+  let tail_events = second_pass.game_events.len() as i64;
+  Ok(serde_json::json!({ "tailRows": tail_rows, "tailEvents": tail_events, "totalBytes": cursor.get() }))
+}
+
 #[napi]
 pub fn parse_player_info(path_or_buf: Either<String, Buffer>) -> napi::Result<Value> {
   let bytes = resolve_byte_type(path_or_buf)?;
