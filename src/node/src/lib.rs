@@ -596,13 +596,17 @@ pub fn parse_ticks(
 
 /// ADR-007 §VI.2 streaming prototype (cs2-analytics): per-round variant of `parse_ticks`.
 /// Instead of returning one bulk result, invokes `callback` once per round with
-/// `{ tick, rows, events }` and drops that round's decoded props/events immediately after
-/// (stands in for "encode+zstd+write" -- not wired to a real encoder here). Forces
-/// single-threaded second pass (see ADR-007 for why streaming requires it: the default
-/// multi-threaded path parallelizes across demo segments with no sequential round boundary).
-/// Runs synchronously on the calling JS thread (same blocking behavior as `parse_ticks` today)
-/// -- not yet using a threadsafe_function/background thread, since the goal here is only to
-/// validate that the callback path + RAM behavior hold up from Node, not to make it async.
+/// `{ tick, rows, events, bytes }` -- `bytes` is that round's actual columnar prop data
+/// (reusing the same `OutputSerdeHelperStruct`/SoA serialization `parse_ticks` already uses,
+/// just JSON-encoded rather than zstd -- the real columnar+quantize+zstd codec lives in
+/// TS/`packages/shared` and is already parity-verified separately; JSON here is only to put a
+/// REAL per-round byte payload across the N-API boundary instead of a 3-number summary) --
+/// then drops that round's decoded props/events immediately after. Forces single-threaded
+/// second pass (see ADR-007 for why streaming requires it: the default multi-threaded path
+/// parallelizes across demo segments with no sequential round boundary). Runs synchronously on
+/// the calling JS thread (same blocking behavior as `parse_ticks` today) -- not yet using a
+/// threadsafe_function/background thread, since the goal here is only to validate that the
+/// callback path + RAM behavior hold up from Node, not to make it async.
 #[napi]
 pub fn parse_ticks_streaming(
   env: Env,
@@ -649,16 +653,26 @@ pub fn parse_ticks_streaming(
     Ok(o) => o,
     Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
   };
+  let mut prop_infos = first_pass_output.prop_controller.prop_infos.clone();
+  prop_infos.sort_by_key(|x| x.prop_name.clone());
 
   let cb: Box<dyn FnMut(RoundFlushChunk)> = Box::new(move |chunk: RoundFlushChunk| {
     let rows: i64 = chunk.output.values().map(|c| c.len() as i64).sum();
+    let events = chunk.game_events.len() as i64;
+    let helper = OutputSerdeHelperStruct {
+      prop_infos: prop_infos.clone(),
+      inner: chunk.output.into(),
+    };
+    let payload_bytes: Vec<u8> = serde_json::to_vec(&helper).unwrap_or_default();
     if let Ok(mut obj) = env.create_object() {
       let _ = obj.set("tick", chunk.tick);
       let _ = obj.set("rows", rows);
-      let _ = obj.set("events", chunk.game_events.len() as i64);
+      let _ = obj.set("events", events);
+      let _ = obj.set("bytes", Buffer::from(payload_bytes));
       let _ = callback.call(None, &[obj.into_unknown()]);
     }
-    // chunk (this round's output/game_events) drops here -> freed before the next round starts
+    // helper/payload_bytes drop here (Buffer already handed its Vec<u8> to JS) -> this round's
+    // decoded props freed before the next round starts
   });
 
   let mut second_pass = match SecondPassParser::new(first_pass_output.clone(), 16, true, None) {
