@@ -7,7 +7,9 @@ use memmap2::MmapOptions;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::JsValuesTupleIntoVec;
 use napi::Either;
+use napi::Env;
 use napi::JsBigInt;
+use napi::JsFunction;
 use napi::JsUnknown;
 use parser::first_pass::parser_settings::rm_map_user_friendly_names;
 use parser::first_pass::parser_settings::rm_user_friendly_names;
@@ -16,6 +18,8 @@ use parser::first_pass::parser_settings::ParserInputs;
 use parser::parse_demo::DemoOutput;
 use parser::parse_demo::Parser;
 use parser::second_pass::parser_settings::create_huffman_lookup_table;
+use parser::second_pass::parser_settings::RoundFlushChunk;
+use parser::second_pass::parser_settings::SecondPassParser;
 use parser::second_pass::variants::soa_to_aos;
 use parser::second_pass::variants::BytesVariant;
 use parser::second_pass::variants::OutputSerdeHelperStruct;
@@ -588,6 +592,86 @@ pub fn parse_ticks(
     };
     Ok(s)
   }
+}
+
+/// ADR-007 §VI.2 streaming prototype (cs2-analytics): per-round variant of `parse_ticks`.
+/// Instead of returning one bulk result, invokes `callback` once per round with
+/// `{ tick, rows, events }` and drops that round's decoded props/events immediately after
+/// (stands in for "encode+zstd+write" -- not wired to a real encoder here). Forces
+/// single-threaded second pass (see ADR-007 for why streaming requires it: the default
+/// multi-threaded path parallelizes across demo segments with no sequential round boundary).
+/// Runs synchronously on the calling JS thread (same blocking behavior as `parse_ticks` today)
+/// -- not yet using a threadsafe_function/background thread, since the goal here is only to
+/// validate that the callback path + RAM behavior hold up from Node, not to make it async.
+#[napi]
+pub fn parse_ticks_streaming(
+  env: Env,
+  path_or_buf: Either<String, Buffer>,
+  wanted_props: Vec<String>,
+  callback: JsFunction,
+) -> napi::Result<Value> {
+  let real_names = match rm_user_friendly_names(&wanted_props) {
+    Ok(names) => names,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+  };
+  let mut real_name_to_og_name = AHashMap::default();
+  for (real_name, user_friendly_name) in real_names.iter().zip(&wanted_props) {
+    real_name_to_og_name.insert(real_name.clone(), user_friendly_name.clone());
+  }
+
+  let bytes = resolve_byte_type(path_or_buf)?;
+  let huf = create_huffman_lookup_table();
+
+  let settings = ParserInputs {
+    real_name_to_og_name,
+    wanted_players: vec![],
+    wanted_player_props: real_names.clone(),
+    wanted_other_props: vec![],
+    // MUST stay empty: collect_data.rs's collect_entities() skips prop collection entirely
+    // when wanted_events is non-empty. Round-boundary detection does not depend on
+    // wanted_events (see second_pass/entities.rs) so this is safe.
+    wanted_events: vec![],
+    wanted_prop_states: AHashMap::default(),
+    parse_ents: true,
+    wanted_ticks: vec![],
+    parse_projectiles: false,
+    only_header: false,
+    list_props: false,
+    only_convars: false,
+    huffman_lookup_table: &huf,
+    order_by_steamid: false,
+    fallback_bytes: None,
+    parse_grenades: false,
+  };
+
+  let mut first_pass_parser = FirstPassParser::new(&settings);
+  let first_pass_output = match first_pass_parser.parse_demo(&bytes[..], false) {
+    Ok(o) => o,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+  };
+
+  let cb: Box<dyn FnMut(RoundFlushChunk)> = Box::new(move |chunk: RoundFlushChunk| {
+    let rows: i64 = chunk.output.values().map(|c| c.len() as i64).sum();
+    if let Ok(mut obj) = env.create_object() {
+      let _ = obj.set("tick", chunk.tick);
+      let _ = obj.set("rows", rows);
+      let _ = obj.set("events", chunk.game_events.len() as i64);
+      let _ = callback.call(None, &[obj.into_unknown()]);
+    }
+    // chunk (this round's output/game_events) drops here -> freed before the next round starts
+  });
+
+  let mut second_pass = match SecondPassParser::new(first_pass_output.clone(), 16, true, None) {
+    Ok(p) => p.with_round_flush(cb),
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+  };
+  if let Err(e) = second_pass.start(&bytes[..]) {
+    return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned()));
+  }
+
+  let tail_rows: i64 = second_pass.output.values().map(|c| c.len() as i64).sum();
+  let tail_events = second_pass.game_events.len() as i64;
+  Ok(serde_json::json!({ "tailRows": tail_rows, "tailEvents": tail_events }))
 }
 
 #[napi]
