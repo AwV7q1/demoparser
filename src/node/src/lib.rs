@@ -2,6 +2,7 @@
 
 #[macro_use]
 extern crate napi_derive;
+mod tick_codec;
 use ahash::AHashMap;
 use memmap2::MmapOptions;
 use napi::bindgen_prelude::*;
@@ -594,6 +595,56 @@ pub fn parse_ticks(
   }
 }
 
+/// ADR-007 §VI.2 parity-debug ONLY: identical to `parse_ticks` but forces
+/// `ParsingMode::ForceSingleThreaded` -- used to isolate whether a Rust-streaming-vs-JS-bulk
+/// mismatch is a real codec bug or an artifact of comparing ST (streaming) against MT (bulk's
+/// default ParsingMode::Normal, which resolves to multi-threaded for most prop sets).
+#[napi]
+pub fn parse_ticks_force_st(
+  path_or_buf: Either<String, Buffer>,
+  wanted_props: Vec<String>,
+) -> napi::Result<Value> {
+  let real_names = match rm_user_friendly_names(&wanted_props) {
+    Ok(names) => names,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+  };
+  let bytes = resolve_byte_type(path_or_buf)?;
+  let huf = create_huffman_lookup_table();
+  let mut real_name_to_og_name = AHashMap::default();
+  for (real_name, user_friendly_name) in real_names.iter().zip(&wanted_props) {
+    real_name_to_og_name.insert(real_name.clone(), user_friendly_name.clone());
+  }
+  let settings = ParserInputs {
+    real_name_to_og_name,
+    wanted_players: vec![],
+    wanted_player_props: real_names.clone(),
+    wanted_other_props: vec![],
+    wanted_events: vec![],
+    wanted_prop_states: AHashMap::default(),
+    parse_ents: true,
+    wanted_ticks: vec![],
+    parse_projectiles: false,
+    only_header: false,
+    list_props: false,
+    only_convars: false,
+    huffman_lookup_table: &huf,
+    order_by_steamid: false,
+    fallback_bytes: None,
+    parse_grenades: false,
+  };
+  let mut parser = Parser::new(settings, parser::parse_demo::ParsingMode::ForceSingleThreaded);
+  let output = parse_demo(bytes, &mut parser)?;
+  let helper = OutputSerdeHelperStruct {
+    prop_infos: output.prop_controller.prop_infos.clone(),
+    inner: output.df.clone().into(),
+  };
+  let s = match serde_json::to_value(&helper) {
+    Ok(s) => s,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
+  };
+  Ok(s)
+}
+
 /// ADR-007 §VI.2 streaming prototype (cs2-analytics): per-round variant of `parse_ticks`.
 /// Instead of returning one bulk result, invokes `callback` once per round with
 /// `{ tick, rows, events, bytes }` -- `bytes` is that round's actual columnar prop data
@@ -653,17 +704,16 @@ pub fn parse_ticks_streaming(
     Ok(o) => o,
     Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
   };
-  let mut prop_infos = first_pass_output.prop_controller.prop_infos.clone();
-  prop_infos.sort_by_key(|x| x.prop_name.clone());
+  let prop_infos = first_pass_output.prop_controller.prop_infos.clone();
+  let name_to_id = tick_codec::build_name_to_id(&prop_infos);
 
   let cb: Box<dyn FnMut(RoundFlushChunk)> = Box::new(move |chunk: RoundFlushChunk| {
     let rows: i64 = chunk.output.values().map(|c| c.len() as i64).sum();
     let events = chunk.game_events.len() as i64;
-    let helper = OutputSerdeHelperStruct {
-      prop_infos: prop_infos.clone(),
-      inner: chunk.output.into(),
-    };
-    let payload_bytes: Vec<u8> = serde_json::to_vec(&helper).unwrap_or_default();
+    // Real pre-zstd payload -- byte-layout-identical to replay-codec-core.ts's
+    // encodeReplayChunkBody (see tick_codec.rs). zstd itself happens on the Node side via the
+    // existing zstdCompress() helper (no C toolchain here to build zstd-sys).
+    let payload_bytes = tick_codec::encode_round_tick_body(&chunk, &name_to_id);
     if let Ok(mut obj) = env.create_object() {
       let _ = obj.set("tick", chunk.tick);
       let _ = obj.set("rows", rows);
@@ -671,7 +721,7 @@ pub fn parse_ticks_streaming(
       let _ = obj.set("bytes", Buffer::from(payload_bytes));
       let _ = callback.call(None, &[obj.into_unknown()]);
     }
-    // helper/payload_bytes drop here (Buffer already handed its Vec<u8> to JS) -> this round's
+    // payload_bytes drops here (Buffer already handed its Vec<u8> to JS) -> this round's
     // decoded props freed before the next round starts
   });
 
