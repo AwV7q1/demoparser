@@ -25,6 +25,9 @@ bit_reverse = "0.1.8"
 memmap2 = "0.9.4"
 serde = { version = "1.0.164", features = ["derive"] }
 serde_json = "1.0"
+# ADR-007 §VI.2i: real Rust-side zstd for the streaming-to-file path (needs a C toolchain via
+# zstd-sys -- unbuildable on this dev machine, verified via Docker's rust:bookworm instead).
+zstd = "0.13"
 libc = "0.2.147"
 rayon = "1.7.0"
 proc-macro2 = "1.0.69"

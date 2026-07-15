@@ -169,8 +169,51 @@ fn run_stream_encode(mmap: &[u8], huf: &Vec<(u8, u8)>) -> Result<(), DemoParserE
     Ok(())
 }
 
+/// Same as run_stream_encode, but also zstd-compresses (level 3, matching Node zlib's
+/// zstdCompressSync default) each round's encoded bytes before dropping both buffers. Isolates:
+/// does REAL zstd compression -- not just the dict/quantize/pack encode -- cost meaningful RAM
+/// on its own, with NO Node/V8 involved at all? Also verifies round-trip correctness (decompress
+/// must reproduce the exact encoded bytes) so this isn't just a RAM number with a silent bug.
+fn run_stream_encode_zstd(mmap: &[u8], huf: &Vec<(u8, u8)>) -> Result<(), DemoParserError> {
+    let input = settings(huf);
+    let mut first_pass_parser = FirstPassParser::new(&input);
+    let first_pass_output: FirstPassOutput = first_pass_parser.parse_demo(mmap, false)?;
+    let prop_infos = first_pass_output.prop_controller.prop_infos.clone();
+    let name_to_id = parser::tick_codec::build_name_to_id(&prop_infos);
+
+    let stats = Rc::new(RefCell::new(StreamStats::default()));
+    let stats_cb = stats.clone();
+    let total_raw = Rc::new(RefCell::new(0usize));
+    let total_raw_cb = total_raw.clone();
+    let cb: Box<dyn FnMut(RoundFlushChunk)> = Box::new(move |chunk: RoundFlushChunk| {
+        let mut s = stats_cb.borrow_mut();
+        s.rounds += 1;
+        s.total_events += chunk.game_events.len();
+        let encoded = parser::tick_codec::encode_round_tick_body(&chunk, &name_to_id);
+        *total_raw_cb.borrow_mut() += encoded.len();
+        let compressed = parser::zstd_codec::compress(&encoded, 3).expect("zstd compress");
+        let roundtrip = parser::zstd_codec::decompress(&compressed).expect("zstd decompress");
+        assert_eq!(roundtrip, encoded, "zstd round-trip mismatch -- would silently corrupt replay data");
+        s.total_rows += compressed.len(); // reuse total_rows field to report total compressed bytes
+        std::hint::black_box(&compressed);
+    });
+
+    let mut second_pass = SecondPassParser::new(first_pass_output.clone(), 16, true, None)?.with_round_flush(cb);
+    let t = Instant::now();
+    second_pass.start(mmap)?;
+    let secs = t.elapsed().as_secs_f64();
+
+    let s = stats.borrow();
+    let raw = *total_raw.borrow();
+    println!(
+        "[stream-encode-zstd] wall {:.3}s  rounds_flushed={}  raw_bytes={}  compressed_bytes={}  events={}  (round-trip verified byte-identical)",
+        secs, s.rounds, raw, s.total_rows, s.total_events
+    );
+    Ok(())
+}
+
 fn main() {
-    let demo_path = env::args().nth(1).expect("usage: parse_stream_bench <demo.dem> [bulk|stream|stream-encode]");
+    let demo_path = env::args().nth(1).expect("usage: parse_stream_bench <demo.dem> [bulk|stream|stream-encode|stream-encode-zstd]");
     let mode = env::args().nth(2).unwrap_or_else(|| "stream".to_string());
 
     let huf = create_huffman_lookup_table();
@@ -182,7 +225,8 @@ fn main() {
         "bulk" => run_bulk(&mmap, &huf),
         "stream" => run_stream(&mmap, &huf).expect("stream parse"),
         "stream-encode" => run_stream_encode(&mmap, &huf).expect("stream-encode parse"),
-        other => panic!("mode must be bulk|stream|stream-encode, got {other}"),
+        "stream-encode-zstd" => run_stream_encode_zstd(&mmap, &huf).expect("stream-encode-zstd parse"),
+        other => panic!("mode must be bulk|stream|stream-encode|stream-encode-zstd, got {other}"),
     }
 
     #[cfg(windows)]

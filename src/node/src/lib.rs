@@ -808,18 +808,23 @@ pub fn parse_ticks_streaming_to_file(
     let events = chunk.game_events.len() as i64;
     let tick = chunk.tick;
     let payload_bytes = parser::tick_codec::encode_round_tick_body(&chunk, &name_to_id);
-    let len = payload_bytes.len() as i64;
+    let raw_len = payload_bytes.len() as i64;
+    // Level 3 matches Node zlib's zstdCompressSync default (ZSTD_CLEVEL_DEFAULT) -- on-disk blob
+    // size stays the same as the current Node-side-compression production behavior.
+    let compressed = parser::zstd_codec::compress(&payload_bytes, 3).unwrap_or(payload_bytes);
+    let len = compressed.len() as i64;
     let offset = cursor_cb.get();
-    if out_file.write_all(&payload_bytes).is_ok() {
+    if out_file.write_all(&compressed).is_ok() {
       cursor_cb.set(offset + len);
     }
-    // payload_bytes drops here -- plain Vec<u8>, never touched V8/N-API at all.
+    // compressed/payload_bytes drop here -- plain Vec<u8>, never touched V8/N-API at all.
     if let Ok(mut obj) = env.create_object() {
       let _ = obj.set("tick", tick);
       let _ = obj.set("rows", rows);
       let _ = obj.set("events", events);
       let _ = obj.set("offset", offset);
       let _ = obj.set("len", len);
+      let _ = obj.set("rawLen", raw_len);
       let _ = callback.call(None, &[obj.into_unknown()]);
     }
   });
