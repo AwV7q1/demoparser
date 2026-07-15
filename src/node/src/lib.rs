@@ -2,6 +2,9 @@
 
 #[macro_use]
 extern crate napi_derive;
+// ADR-007 roadmap bước 4, Giai đoạn 2 (cs2-analytics): compute_full_pipeline_async, napi::Task
+// thật đầu tiên trong crate này -- xem full_pipeline.rs.
+mod full_pipeline;
 use ahash::AHashMap;
 use memmap2::MmapOptions;
 use napi::bindgen_prelude::*;

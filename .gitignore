@@ -1,5 +1,6 @@
 target/
 .vscode/
+node_modules/
 venv
 .venv
 flamegraph.svg
