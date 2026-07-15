@@ -2,7 +2,6 @@
 
 #[macro_use]
 extern crate napi_derive;
-mod tick_codec;
 use ahash::AHashMap;
 use memmap2::MmapOptions;
 use napi::bindgen_prelude::*;
@@ -705,7 +704,7 @@ pub fn parse_ticks_streaming(
     Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}", e).to_owned())),
   };
   let prop_infos = first_pass_output.prop_controller.prop_infos.clone();
-  let name_to_id = tick_codec::build_name_to_id(&prop_infos);
+  let name_to_id = parser::tick_codec::build_name_to_id(&prop_infos);
 
   let cb: Box<dyn FnMut(RoundFlushChunk)> = Box::new(move |chunk: RoundFlushChunk| {
     let rows: i64 = chunk.output.values().map(|c| c.len() as i64).sum();
@@ -713,7 +712,7 @@ pub fn parse_ticks_streaming(
     // Real pre-zstd payload -- byte-layout-identical to replay-codec-core.ts's
     // encodeReplayChunkBody (see tick_codec.rs). zstd itself happens on the Node side via the
     // existing zstdCompress() helper (no C toolchain here to build zstd-sys).
-    let payload_bytes = tick_codec::encode_round_tick_body(&chunk, &name_to_id);
+    let payload_bytes = parser::tick_codec::encode_round_tick_body(&chunk, &name_to_id);
     if let Ok(mut obj) = env.create_object() {
       let _ = obj.set("tick", chunk.tick);
       let _ = obj.set("rows", rows);

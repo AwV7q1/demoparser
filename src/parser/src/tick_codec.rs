@@ -11,10 +11,10 @@
 // what makes the parity test meaningful. Field-by-field mapping mirrors compute.ts's
 // toTickRow(); dtype/order mirrors replay-codec-core.ts's COLUMNS table.
 
+use crate::first_pass::prop_controller::PropInfo;
+use crate::second_pass::parser_settings::RoundFlushChunk;
+use crate::second_pass::variants::{PropColumn, Variant, VarVec};
 use ahash::HashMap;
-use parser::first_pass::prop_controller::PropInfo;
-use parser::second_pass::parser_settings::RoundFlushChunk;
-use parser::second_pass::variants::{PropColumn, Variant, VarVec};
 
 const NULL_U8: u8 = 255;
 const NULL_U16: u16 = 65535;

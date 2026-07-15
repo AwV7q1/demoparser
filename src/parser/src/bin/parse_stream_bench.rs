@@ -132,8 +132,45 @@ fn run_stream(mmap: &[u8], huf: &Vec<(u8, u8)>) -> Result<(), DemoParserError> {
     Ok(())
 }
 
+/// Same as run_stream, but the round_flush callback does the REAL encode (tick_codec::
+/// encode_round_tick_body -- dict/quantize/pack, byte-identical to replay-codec-core.ts) then
+/// drops the resulting bytes, instead of just counting. Isolates: does the ENCODING
+/// computation itself (Vec<Row> intermediate, dictionaries, packed column buffers) cost
+/// meaningful RAM on its own, with NO Node/V8 involved at all?
+fn run_stream_encode(mmap: &[u8], huf: &Vec<(u8, u8)>) -> Result<(), DemoParserError> {
+    let input = settings(huf);
+    let mut first_pass_parser = FirstPassParser::new(&input);
+    let first_pass_output: FirstPassOutput = first_pass_parser.parse_demo(mmap, false)?;
+    let prop_infos = first_pass_output.prop_controller.prop_infos.clone();
+    let name_to_id = parser::tick_codec::build_name_to_id(&prop_infos);
+
+    let stats = Rc::new(RefCell::new(StreamStats::default()));
+    let stats_cb = stats.clone();
+    let cb: Box<dyn FnMut(RoundFlushChunk)> = Box::new(move |chunk: RoundFlushChunk| {
+        let mut s = stats_cb.borrow_mut();
+        s.rounds += 1;
+        s.total_events += chunk.game_events.len();
+        let encoded = parser::tick_codec::encode_round_tick_body(&chunk, &name_to_id);
+        s.total_rows += encoded.len(); // reuse total_rows field to report total encoded bytes
+        std::hint::black_box(&encoded);
+        // encoded drops here -> frees this round's encoded bytes, same as chunk did in run_stream
+    });
+
+    let mut second_pass = SecondPassParser::new(first_pass_output.clone(), 16, true, None)?.with_round_flush(cb);
+    let t = Instant::now();
+    second_pass.start(mmap)?;
+    let secs = t.elapsed().as_secs_f64();
+
+    let s = stats.borrow();
+    println!(
+        "[stream-encode] wall {:.3}s  rounds_flushed={}  total_encoded_bytes={}  events={}",
+        secs, s.rounds, s.total_rows, s.total_events
+    );
+    Ok(())
+}
+
 fn main() {
-    let demo_path = env::args().nth(1).expect("usage: parse_stream_bench <demo.dem> [bulk|stream]");
+    let demo_path = env::args().nth(1).expect("usage: parse_stream_bench <demo.dem> [bulk|stream|stream-encode]");
     let mode = env::args().nth(2).unwrap_or_else(|| "stream".to_string());
 
     let huf = create_huffman_lookup_table();
@@ -144,7 +181,8 @@ fn main() {
     match mode.as_str() {
         "bulk" => run_bulk(&mmap, &huf),
         "stream" => run_stream(&mmap, &huf).expect("stream parse"),
-        other => panic!("mode must be bulk|stream, got {other}"),
+        "stream-encode" => run_stream_encode(&mmap, &huf).expect("stream-encode parse"),
+        other => panic!("mode must be bulk|stream|stream-encode, got {other}"),
     }
 
     #[cfg(windows)]

@@ -413,6 +413,7 @@ dependencies = [
  "rayon",
  "regex",
  "serde",
+ "serde_json",
  "snap",
  "windows-sys 0.52.0",
 ]
