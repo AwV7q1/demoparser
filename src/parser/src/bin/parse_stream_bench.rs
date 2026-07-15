@@ -90,6 +90,28 @@ fn run_bulk(mmap: &[u8], huf: &Vec<(u8, u8)>) {
     std::hint::black_box(&out);
 }
 
+/// Same as run_bulk, but ForceMultiThreaded instead of ForceSingleThreaded -- real parallel
+/// first-pass decode (parse_demo.rs splits by fullpacket_offsets, combine_dfs at the end). Exists
+/// to answer ADR-007 §VI checklist item 3/4: how much RAM/time does real MT bulk cost/save versus
+/// ST streaming (run_stream) on the SAME demo -- the "parallel within one demo" axis that was
+/// deliberately excluded from every ST/ST comparison done so far (see module doc + ADR §VI.2c).
+fn run_bulk_mt(mmap: &[u8], huf: &Vec<(u8, u8)>) {
+    use parser::parse_demo::{Parser, ParsingMode};
+    let mut p = Parser::new(settings(huf), ParsingMode::ForceMultiThreaded);
+    let t = Instant::now();
+    let out = p.parse_demo(mmap).expect("parse");
+    let secs = t.elapsed().as_secs_f64();
+    let rows: usize = out.df.values().map(|c| c.len()).sum();
+    println!(
+        "[bulk-mt] wall {:.3}s  cols={}  rows={}  events={}",
+        secs,
+        out.df.len(),
+        rows,
+        out.game_events.len()
+    );
+    std::hint::black_box(&out);
+}
+
 fn run_stream(mmap: &[u8], huf: &Vec<(u8, u8)>) -> Result<(), DemoParserError> {
     let input = settings(huf);
     let mut first_pass_parser = FirstPassParser::new(&input);
@@ -213,7 +235,7 @@ fn run_stream_encode_zstd(mmap: &[u8], huf: &Vec<(u8, u8)>) -> Result<(), DemoPa
 }
 
 fn main() {
-    let demo_path = env::args().nth(1).expect("usage: parse_stream_bench <demo.dem> [bulk|stream|stream-encode|stream-encode-zstd]");
+    let demo_path = env::args().nth(1).expect("usage: parse_stream_bench <demo.dem> [bulk|bulk-mt|stream|stream-encode|stream-encode-zstd]");
     let mode = env::args().nth(2).unwrap_or_else(|| "stream".to_string());
 
     let huf = create_huffman_lookup_table();
@@ -223,10 +245,11 @@ fn main() {
 
     match mode.as_str() {
         "bulk" => run_bulk(&mmap, &huf),
+        "bulk-mt" => run_bulk_mt(&mmap, &huf),
         "stream" => run_stream(&mmap, &huf).expect("stream parse"),
         "stream-encode" => run_stream_encode(&mmap, &huf).expect("stream-encode parse"),
         "stream-encode-zstd" => run_stream_encode_zstd(&mmap, &huf).expect("stream-encode-zstd parse"),
-        other => panic!("mode must be bulk|stream|stream-encode|stream-encode-zstd, got {other}"),
+        other => panic!("mode must be bulk|bulk-mt|stream|stream-encode|stream-encode-zstd, got {other}"),
     }
 
     #[cfg(windows)]
