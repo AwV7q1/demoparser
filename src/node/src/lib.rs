@@ -10,6 +10,7 @@ use napi::Either;
 use napi::Env;
 use napi::JsBigInt;
 use napi::JsFunction;
+use napi::JsObject;
 use napi::JsUnknown;
 use parser::first_pass::parser_settings::rm_map_user_friendly_names;
 use parser::first_pass::parser_settings::rm_user_friendly_names;
@@ -905,6 +906,126 @@ pub fn parse_player_skins(path_or_buf: Either<String, Buffer>) -> napi::Result<V
   };
   Ok(s)
 }
+// ADR-007 §VI.2 (cs2-analytics) "events" domain port. Second stage, orthogonal to every parse_*
+// function above: takes the SAME shape Node already has today from parse_events()/parse_grenades()
+// (or from @laihoe/demoparser2 in production) and computes rounds/events/replay-event-chunk blobs
+// -- pure compute logic ported from packages/parse-core/src/compute.ts's "events" section, see
+// src/parser/src/compute_events/. Does NOT touch demo parsing itself (no new parse_ticks*
+// variant, no change to any function above).
+#[napi]
+pub fn compute_events(
+  env: Env,
+  all_events: Value,
+  grenade_rows: Value,
+  zstd_level: Option<i32>,
+) -> napi::Result<JsObject> {
+  let events_in: Vec<parser::compute_events::RawEvent> = match serde_json::from_value(all_events) {
+    Ok(v) => v,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("all_events: {e}"))),
+  };
+  let grenade_in: Vec<parser::compute_events::RawGrenadeSample> = match serde_json::from_value(grenade_rows) {
+    Ok(v) => v,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("grenade_rows: {e}"))),
+  };
+  let level = zstd_level.unwrap_or(3);
+  let result = parser::compute_events::compute_events(&events_in, &grenade_in, level);
+
+  let rounds_val = match serde_json::to_value(&result.rounds) {
+    Ok(v) => v,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("rounds serialize: {e}"))),
+  };
+
+  let mut chunks_arr = env.create_array_with_length(result.replay_event_chunks.len())?;
+  for (i, c) in result.replay_event_chunks.iter().enumerate() {
+    let mut chunk_obj = env.create_object()?;
+    chunk_obj.set("roundNumber", c.round_number)?;
+    chunk_obj.set("format", c.format)?;
+    chunk_obj.set("eventCount", c.event_count)?;
+    chunk_obj.set("data", Buffer::from(c.data.clone()))?;
+    chunks_arr.set_element(i as u32, chunk_obj)?;
+  }
+
+  let mut out = env.create_object()?;
+  out.set("rounds", rounds_val)?;
+  out.set("events", Value::Array(result.events))?;
+  out.set("replayEventChunks", chunks_arr)?;
+  Ok(out)
+}
+
+// ADR-007 §VI.2 (cs2-analytics) "stats" domain port. Independent of compute_events at the N-API
+// boundary -- kills_batch/weapon_fire_batch/hurt_batch are dumped from the SAME shape TS's own
+// killsBatch/weaponFireBatch/hurtBatch already have (i.e. compute.ts's own buildKills/
+// buildWeaponFire/buildHurt output), not chained through this addon's compute_events. raw_kills/
+// raw_hurt/player_info/tick_data are the other raw inputs computePlayerStats/computeTickAggregates
+// read directly. See src/parser/src/compute_stats/.
+#[napi]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_stats(
+  kills_batch: Value,
+  weapon_fire_batch: Value,
+  hurt_batch: Value,
+  raw_kills: Value,
+  raw_hurt: Value,
+  player_info: Value,
+  tick_data: Value,
+  rounds: Value,
+) -> napi::Result<Value> {
+  macro_rules! parse {
+    ($field:expr, $ty:ty, $name:literal) => {
+      match serde_json::from_value::<$ty>($field) {
+        Ok(v) => v,
+        Err(e) => return Err(Error::new(Status::InvalidArg, format!("{}: {e}", $name))),
+      }
+    };
+  }
+  let kills_batch = parse!(kills_batch, Vec<parser::compute_stats::KillsBatchItem>, "kills_batch");
+  let weapon_fire_batch = parse!(weapon_fire_batch, Vec<parser::compute_stats::WeaponFireBatchItem>, "weapon_fire_batch");
+  let hurt_batch = parse!(hurt_batch, Vec<parser::compute_stats::HurtBatchItem>, "hurt_batch");
+  let raw_kills = parse!(raw_kills, Vec<parser::compute_stats::RawKillRow>, "raw_kills");
+  let raw_hurt = parse!(raw_hurt, Vec<parser::compute_stats::RawHurtRow>, "raw_hurt");
+  let player_info = parse!(player_info, Vec<parser::compute_stats::RawPlayerInfo>, "player_info");
+  let rounds = parse!(rounds, Vec<parser::compute_events::ParsedRound>, "rounds");
+
+  let result = parser::compute_stats::compute_stats(
+    &kills_batch, &weapon_fire_batch, &hurt_batch, &raw_kills, &raw_hurt, &player_info, &tick_data, &rounds,
+  );
+
+  let out = serde_json::json!({
+    "matchWeaponStats": result.match_weapon_stats,
+    "playerAccuracyStats": result.player_accuracy_stats,
+    "playerMatchStats": result.player_match_stats,
+    "roundSurvivorStats": result.round_survivor_stats,
+    "playerZoneStats": result.player_zone_stats,
+    "roundEconomyStats": result.round_economy_stats,
+    "roundPlayerDamageStats": result.round_player_damage_stats,
+  });
+  Ok(out)
+}
+
+// ADR-007 §VI.2 (cs2-analytics) "aim" domain port. See src/parser/src/compute_aim/ -- takes
+// AIM_TICK_FIELDS rows already fetched for the same kill-window ticks computeAimStats itself
+// would have asked parser.parseTicks() for (this addon does not call the parser here).
+#[napi]
+pub fn compute_aim_stats(kill_events: Value, weapon_fire_batch: Value, aim_tick_rows: Value) -> napi::Result<Value> {
+  let kill_events: Vec<parser::compute_aim::RawAimKillRow> = match serde_json::from_value(kill_events) {
+    Ok(v) => v,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("kill_events: {e}"))),
+  };
+  let weapon_fire_batch: Vec<parser::compute_stats::WeaponFireBatchItem> = match serde_json::from_value(weapon_fire_batch) {
+    Ok(v) => v,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("weapon_fire_batch: {e}"))),
+  };
+  let aim_tick_rows: Vec<parser::compute_aim::RawAimTickRow> = match serde_json::from_value(aim_tick_rows) {
+    Ok(v) => v,
+    Err(e) => return Err(Error::new(Status::InvalidArg, format!("aim_tick_rows: {e}"))),
+  };
+  let result = parser::compute_aim::compute_aim_stats(&kill_events, &weapon_fire_batch, &aim_tick_rows);
+  match serde_json::to_value(&result) {
+    Ok(v) => Ok(v),
+    Err(e) => Err(Error::new(Status::InvalidArg, format!("{}", e))),
+  }
+}
+
 #[napi]
 pub fn list_updated_fields(path_or_buf: Either<String, Buffer>) -> napi::Result<Value> {
   let bytes = resolve_byte_type(path_or_buf)?;

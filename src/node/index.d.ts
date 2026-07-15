@@ -12,6 +12,28 @@ export function parseEvents(pathOrBuf: string | Buffer, eventNames?: Array<strin
 export function parseTicks(pathOrBuf: string | Buffer, wantedProps: Array<string>, wantedTicks?: Array<number> | undefined | null, wantedPlayers?: Array<string> | undefined | null, structOfArrays?: boolean | undefined | null, orderBySteamid?: boolean | undefined | null, propStates?: Array<WantedPropState> | undefined | null): any
 export function parsePlayerInfo(pathOrBuf: string | Buffer): any
 export function parsePlayerSkins(pathOrBuf: string | Buffer): any
+/**
+ * ADR-007 §VI.2 (cs2-analytics) "events" domain port. Second stage, orthogonal to every parse_*
+ * function above: takes the SAME shape Node already has today from parse_events()/parse_grenades()
+ * (or from @laihoe/demoparser2 in production) and computes rounds/events/replay-event-chunk blobs
+ * -- pure compute logic ported from packages/parse-core/src/compute.ts's "events" section, see
+ * src/parser/src/compute_events/. Does NOT touch demo parsing itself (no new parse_ticks*
+ * variant, no change to any function above).
+ */
+export function computeEvents(allEvents: any, grenadeRows: any, zstdLevel?: number | undefined | null): any
+/**
+ * ADR-007 §VI.2 (cs2-analytics) "stats" domain port. Independent of computeEvents -- kills_batch/
+ * weapon_fire_batch/hurt_batch are TS's own killsBatch/weaponFireBatch/hurtBatch (buildKills/
+ * buildWeaponFire/buildHurt output), not re-derived from computeEvents' output. See
+ * src/parser/src/compute_stats/.
+ */
+export function computeStats(killsBatch: any, weaponFireBatch: any, hurtBatch: any, rawKills: any, rawHurt: any, playerInfo: any, tickData: any, rounds: any): any
+/**
+ * ADR-007 §VI.2 (cs2-analytics) "aim" domain port. `aimTickRows` must already be fetched for the
+ * same kill-window ticks computeAimStats itself would ask parser.parseTicks() for -- this
+ * function does not call the parser. See src/parser/src/compute_aim/.
+ */
+export function computeAimStats(killEvents: any, weaponFireBatch: any, aimTickRows: any): any
 export function listUpdatedFields(pathOrBuf: string | Buffer): any
 export class JsVariant { }
 export class WantedPropState {

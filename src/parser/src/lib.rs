@@ -1,5 +1,8 @@
 #[cfg(test)]
 pub mod e2e_test;
+pub mod compute_aim;
+pub mod compute_events;
+pub mod compute_stats;
 pub mod first_pass;
 pub mod maps;
 pub mod parse_demo;
