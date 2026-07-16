@@ -15,21 +15,27 @@
 // không phải gọi ngược lại các hàm #[napi] hiện có (vốn nhận tham số kiểu napi Either/Buffer chỉ
 // hợp lệ trên main thread lúc entry).
 //
-// Scope: giống bench.mjs ở Giai đoạn 1 -- gồm raw parse (events/grenades/playerInfo/ticks×2) +
-// computeEvents + computeStats + computeAimStats. CHƯA gồm ReplayChunk (tick-codec streaming) --
-// để dành Giai đoạn 3 khi wiring production thật, 2 luồng sẽ ghép chung.
+// Scope: giống bench.mjs ở Giai đoạn 1 -- gồm raw parse (events/grenades/playerInfo/ticks) +
+// computeEvents + computeStats + computeAimStats + ReplayChunk/ReplayEventChunk (Giai đoạn 3,
+// wiring production thật) -- ReplayChunk giờ ăn theo CÙNG lượt tick gộp B1 bên dưới (slice cột
+// thô từ MergedTickPass), không phải một lượt ForceSingleThreaded riêng.
+//
+// plan-128tick-tick-decode-optimization.md B1+B3: 2 lượt quét tick riêng (sampled + aim) đã gộp
+// thành 1 (`run_parse_ticks_pass` + `extract_tick_view`), và huffman lookup table build 1 lần
+// (`compute()`) thay vì rebuild ở mỗi run_parse_* -- xem doc comment từng hàm.
 
 use ahash::AHashMap;
+use ahash::AHashSet;
 use memmap2::MmapOptions;
 use napi::bindgen_prelude::*;
 use napi::Error;
 use napi::JsObject;
 use napi::Status;
 use parser::first_pass::parser_settings::{rm_user_friendly_names, FirstPassParser, ParserInputs};
-use parser::first_pass::prop_controller::PropInfo;
+use parser::first_pass::prop_controller::{PropInfo, TICK_ID};
 use parser::parse_demo::{Parser, ParsingMode};
 use parser::second_pass::parser_settings::create_huffman_lookup_table;
-use parser::second_pass::variants::{soa_to_aos, OutputSerdeHelperStruct, PropColumn};
+use parser::second_pass::variants::{soa_to_aos, OutputSerdeHelperStruct, PropColumn, VarVec};
 use parser::tick_codec::{build_replay_chunks, ReplayChunkParsed};
 use serde_json::Value;
 use std::fs::File;
@@ -45,7 +51,7 @@ fn mmap_path(path: &str) -> napi::Result<memmap2::Mmap> {
   unsafe { MmapOptions::new().map(&file) }.map_err(io_err)
 }
 
-fn run_parse_events(path: &str, event_names: Vec<String>, player_props: Vec<String>, other_props: Vec<String>) -> napi::Result<Value> {
+fn run_parse_events(path: &str, huf: &Vec<(u8, u8)>, event_names: Vec<String>, player_props: Vec<String>, other_props: Vec<String>) -> napi::Result<Value> {
   let real_names_player = rm_user_friendly_names(&player_props).map_err(io_err)?;
   let real_other_props = rm_user_friendly_names(&other_props).map_err(io_err)?;
 
@@ -58,7 +64,6 @@ fn run_parse_events(path: &str, event_names: Vec<String>, player_props: Vec<Stri
   }
 
   let mmap = mmap_path(path)?;
-  let huf = create_huffman_lookup_table();
   let settings = ParserInputs {
     real_name_to_og_name,
     wanted_players: vec![],
@@ -72,7 +77,7 @@ fn run_parse_events(path: &str, event_names: Vec<String>, player_props: Vec<Stri
     only_header: true,
     list_props: false,
     only_convars: false,
-    huffman_lookup_table: &huf,
+    huffman_lookup_table: huf,
     order_by_steamid: false,
     fallback_bytes: None,
     parse_grenades: false,
@@ -82,9 +87,8 @@ fn run_parse_events(path: &str, event_names: Vec<String>, player_props: Vec<Stri
   serde_json::to_value(&output.game_events).map_err(io_err)
 }
 
-fn run_parse_grenades(path: &str) -> napi::Result<Value> {
+fn run_parse_grenades(path: &str, huf: &Vec<(u8, u8)>) -> napi::Result<Value> {
   let mmap = mmap_path(path)?;
-  let huf = create_huffman_lookup_table();
   let settings = ParserInputs {
     wanted_players: vec![],
     real_name_to_og_name: AHashMap::default(),
@@ -98,7 +102,7 @@ fn run_parse_grenades(path: &str) -> napi::Result<Value> {
     only_header: true,
     list_props: false,
     only_convars: false,
-    huffman_lookup_table: &huf,
+    huffman_lookup_table: huf,
     order_by_steamid: false,
     fallback_bytes: None,
     parse_grenades: false, // KHÔNG parse grenade LOGIC (throw/detonate) -- chỉ tick sample vị trí, đúng dp.parseGrenades(demoPath, null, false) phía Node dùng ở bench.mjs.
@@ -111,9 +115,8 @@ fn run_parse_grenades(path: &str) -> napi::Result<Value> {
   serde_json::to_value(&result).map_err(io_err)
 }
 
-fn run_parse_player_info(path: &str) -> napi::Result<Value> {
+fn run_parse_player_info(path: &str, huf: &Vec<(u8, u8)>) -> napi::Result<Value> {
   let mmap = mmap_path(path)?;
-  let huf = create_huffman_lookup_table();
   let settings = ParserInputs {
     wanted_players: vec![],
     real_name_to_og_name: AHashMap::default(),
@@ -127,7 +130,7 @@ fn run_parse_player_info(path: &str) -> napi::Result<Value> {
     only_header: true,
     list_props: false,
     only_convars: false,
-    huffman_lookup_table: &huf,
+    huffman_lookup_table: huf,
     order_by_steamid: false,
     fallback_bytes: None,
     parse_grenades: false,
@@ -137,7 +140,18 @@ fn run_parse_player_info(path: &str) -> napi::Result<Value> {
   serde_json::to_value(&output.player_md).map_err(io_err)
 }
 
-fn run_parse_ticks(path: &str, wanted_props: Vec<String>, wanted_ticks: Vec<i32>, struct_of_arrays: bool) -> napi::Result<Value> {
+// ADR-007 tick-pass fusion (B1): raw columnar output of ONE merged second-pass walk requesting
+// the UNION of two different tick-cadence field lists (e.g. sampled-every-8 ∪ dense-aim-window).
+// Kept un-serialized so `extract_tick_view` can slice it into each view's own rows/fields after
+// the fact, instead of walking the demo twice (the expensive, walk-bound part -- see B1 note in
+// .claude/note/plan-128tick-tick-decode-optimization.md).
+struct MergedTickPass {
+  df: AHashMap<u32, PropColumn>,
+  prop_infos: Vec<PropInfo>,
+  tickrate: u32,
+}
+
+fn run_parse_ticks_pass(path: &str, huf: &Vec<(u8, u8)>, wanted_props: Vec<String>, wanted_ticks: Vec<i32>, velocity_tick_filter: AHashSet<i32>) -> napi::Result<MergedTickPass> {
   let real_names = rm_user_friendly_names(&wanted_props).map_err(io_err)?;
   let mut real_name_to_og_name = AHashMap::default();
   for (real_name, og) in real_names.iter().zip(&wanted_props) {
@@ -145,7 +159,6 @@ fn run_parse_ticks(path: &str, wanted_props: Vec<String>, wanted_ticks: Vec<i32>
   }
 
   let mmap = mmap_path(path)?;
-  let huf = create_huffman_lookup_table();
   let settings = ParserInputs {
     real_name_to_og_name,
     wanted_players: vec![],
@@ -159,7 +172,7 @@ fn run_parse_ticks(path: &str, wanted_props: Vec<String>, wanted_ticks: Vec<i32>
     only_header: false,
     list_props: false,
     only_convars: false,
-    huffman_lookup_table: &huf,
+    huffman_lookup_table: huf,
     order_by_steamid: false,
     fallback_bytes: None,
     parse_grenades: false,
@@ -168,13 +181,62 @@ fn run_parse_ticks(path: &str, wanted_props: Vec<String>, wanted_ticks: Vec<i32>
   // this prop set, splitting the demo into segments each with its own history buffer -> velocity
   // props go null/0 at segment boundaries, diverging from the ST baseline all parity was verified
   // against. ST keeps continuous history, so replay/aim ticks stay byte-identical with parity.
-  let mut parser = Parser::new(settings, ParsingMode::ForceSingleThreaded);
+  //
+  // velocity_tick_filter: see SecondPassParser::velocity_tick_filter -- `wanted_ticks` above is a
+  // UNION of two cadences sharing one internal `self.output`; without this, velocity's "previous
+  // collected tick" search could land on a row from the OTHER cadence and corrupt the delta. This
+  // is a DIFFERENT failure mode than the segment-boundary one above (same-buffer cross-cadence
+  // contamination vs cross-buffer segment split) -- ForceSingleThreaded does not make this filter
+  // redundant, nor vice versa; both guards are needed together on the merged (B1) pass.
+  let mut parser = Parser::new(settings, ParsingMode::ForceSingleThreaded).with_velocity_tick_filter(velocity_tick_filter);
   let output = parser.parse_demo(&mmap).map_err(io_err)?;
 
   let mut prop_infos = output.prop_controller.prop_infos.clone();
   prop_infos.sort_by_key(|x| x.prop_name.clone());
-  let helper = OutputSerdeHelperStruct { prop_infos, inner: output.df.clone().into() };
+  Ok(MergedTickPass { df: output.df, prop_infos, tickrate: output.tickrate })
+}
 
+// Slices a `MergedTickPass` down to just `view_fields` (+ the always-present tick/steamid/name
+// baseline -- see prop_controller.rs set_custom_propinfos, pushed unconditionally) and rows whose
+// TICK_ID is in `view_ticks`, returning the RAW columnar df + prop_infos -- byte-for-byte what a
+// standalone `run_parse_ticks(view_fields, view_ticks.collect())` call would have produced,
+// without a second demo walk. Kept un-serialized so a caller can feed it straight into
+// `build_replay_chunks` (needs columns, not JSON) as well as into `extract_tick_view` (JSON).
+fn slice_tick_columns(merged: &MergedTickPass, view_fields: &[String], view_ticks: &AHashSet<i32>) -> (AHashMap<u32, PropColumn>, Vec<PropInfo>) {
+  let tick_col = merged.df.get(&TICK_ID).and_then(|c| c.data.as_ref());
+  let indices: Vec<usize> = match tick_col {
+    Some(VarVec::I32(v)) => v
+      .iter()
+      .enumerate()
+      .filter(|(_, t)| t.map_or(false, |t| view_ticks.contains(&t)))
+      .map(|(i, _)| i)
+      .collect(),
+    _ => vec![],
+  };
+
+  let mut keep_names: AHashSet<&str> = view_fields.iter().map(|s| s.as_str()).collect();
+  keep_names.insert("tick");
+  keep_names.insert("steamid");
+  keep_names.insert("name");
+
+  let prop_infos: Vec<PropInfo> = merged.prop_infos.iter().filter(|p| keep_names.contains(p.prop_friendly_name.as_str())).cloned().collect();
+
+  let mut inner: AHashMap<u32, PropColumn> = AHashMap::default();
+  for p in &prop_infos {
+    if let Some(col) = merged.df.get(&p.id) {
+      if let Some(sliced) = col.slice_to_new(&indices) {
+        inner.insert(p.id, sliced);
+      }
+    }
+  }
+
+  (inner, prop_infos)
+}
+
+// Same slice as `slice_tick_columns`, serialized to SoA (struct_of_arrays) or AoS JSON.
+fn extract_tick_view(merged: &MergedTickPass, view_fields: &[String], view_ticks: &AHashSet<i32>, struct_of_arrays: bool) -> napi::Result<Value> {
+  let (inner, prop_infos) = slice_tick_columns(merged, view_fields, view_ticks);
+  let helper = OutputSerdeHelperStruct { prop_infos, inner: inner.into() };
   if struct_of_arrays {
     serde_json::to_value(&helper).map_err(io_err)
   } else {
@@ -208,41 +270,6 @@ fn run_parse_header(path: &str) -> napi::Result<AHashMap<String, String>> {
   };
   let mut parser = FirstPassParser::new(&settings);
   parser.parse_header_only(&mmap).map_err(io_err)
-}
-
-/// Sampled-tick parse returning the RAW columnar df + prop_infos (not JSON). Lets us both build
-/// replay chunks (encode straight from columns, no re-normalize) AND serialize to SoA JSON for
-/// compute_stats -- from ONE parse. ForceSingleThreaded, same velocity-parity reason as above.
-fn run_parse_ticks_raw(path: &str, wanted_props: Vec<String>, wanted_ticks: Vec<i32>) -> napi::Result<(AHashMap<u32, PropColumn>, Vec<PropInfo>)> {
-  let real_names = rm_user_friendly_names(&wanted_props).map_err(io_err)?;
-  let mut real_name_to_og_name = AHashMap::default();
-  for (real_name, og) in real_names.iter().zip(&wanted_props) {
-    real_name_to_og_name.insert(real_name.clone(), og.clone());
-  }
-
-  let mmap = mmap_path(path)?;
-  let huf = create_huffman_lookup_table();
-  let settings = ParserInputs {
-    real_name_to_og_name,
-    wanted_players: vec![],
-    wanted_player_props: real_names.clone(),
-    wanted_other_props: vec![],
-    wanted_events: vec![],
-    wanted_prop_states: AHashMap::default(),
-    parse_ents: true,
-    wanted_ticks,
-    parse_projectiles: false,
-    only_header: false,
-    list_props: false,
-    only_convars: false,
-    huffman_lookup_table: &huf,
-    order_by_steamid: false,
-    fallback_bytes: None,
-    parse_grenades: false,
-  };
-  let mut parser = Parser::new(settings, ParsingMode::ForceSingleThreaded);
-  let output = parser.parse_demo(&mmap).map_err(io_err)?;
-  Ok((output.df, output.prop_controller.prop_infos))
 }
 
 // -- constants (subset, y hệt packages/parse-core/src/constants.ts / prototypes bench.mjs) --
@@ -313,11 +340,14 @@ impl Task for FullPipelineTask {
   // toàn bộ lý do hàm này không chặn main thread: mọi việc nặng (đọc/giải mã demo + tính domain
   // logic) đều nằm ở đây.
   fn compute(&mut self) -> napi::Result<Self::Output> {
-    // 1) raw parse (4 lần decode demo -- events/grenades/playerInfo/ticks-sampled -- + 1 lần nữa
-    //    cho cửa sổ aim bên dưới, đúng 5 lần như đã đo ở Giai đoạn 1).
-    let raw_events_val = run_parse_events(&self.path, all_event_names(), all_event_player_fields(), all_event_other_fields())?;
-    let grenade_rows_val = run_parse_grenades(&self.path)?;
-    let player_info_val = run_parse_player_info(&self.path)?;
+    // B3: huffman lookup table built ONCE (used to be rebuilt per raw-parse call, 5x/job).
+    let huf = create_huffman_lookup_table();
+
+    // 1) raw parse -- events/grenades/playerInfo (3 lần decode demo) + 1 lần quét tick GỘP (B1)
+    //    thay cho 2 lượt riêng (sampled + aim) trước đây -- 4 lần tổng, thay vì 5.
+    let raw_events_val = run_parse_events(&self.path, &huf, all_event_names(), all_event_player_fields(), all_event_other_fields())?;
+    let grenade_rows_val = run_parse_grenades(&self.path, &huf)?;
+    let player_info_val = run_parse_player_info(&self.path, &huf)?;
 
     let raw_events_arr = raw_events_val.as_array().cloned().unwrap_or_default();
     let raw_kills_arr: Vec<Value> = raw_events_arr
@@ -375,26 +405,55 @@ impl Task for FullPipelineTask {
       }
     }
 
-    // 3) sampled tick data (SAMPLED_TICK_FIELDS) -- replicate wantedTicks compute.ts computes.
+    // 3+4) B1: MỘT lượt quét tick gộp field ∪ field + tick ∪ tick, thay cho 2 lượt riêng
+    // (sampled_tick_fields SoA cho stats + aim_tick_fields AoS quanh mỗi kill). ReplayChunk (Giai
+    // đoạn 3) ăn theo CÙNG lượt gộp này (slice cột thô, không phải 1 lượt ForceSingleThreaded
+    // riêng nữa) -- xem MergedTickPass/run_parse_ticks_pass/extract_tick_view/slice_tick_columns
+    // ở trên. Tổng số lượt quét tick: 1 (thay vì 2 riêng sampled+aim trước B1, hoặc 2 nếu
+    // ReplayChunk tự đi quét riêng như bản gốc chưa fuse với B1).
     let last_tick = round_end_ticks.iter().copied().max().unwrap_or(0).max(0);
-    let mut wanted_ticks_i32: Vec<i32> = Vec::new();
+    let mut sampled_ticks_i32: Vec<i32> = Vec::new();
     let mut t = 0i64;
     while t <= last_tick {
-      wanted_ticks_i32.push(t as i32);
+      sampled_ticks_i32.push(t as i32);
       t += PLAYER_TICK_SAMPLE_STEP;
     }
     // DemoTooLargeError guard (compute.ts:63) -- cap sampled tick count.
-    if (wanted_ticks_i32.len() as i64) > self.max_demo_ticks {
+    if (sampled_ticks_i32.len() as i64) > self.max_demo_ticks {
       return Err(Error::new(
         Status::GenericFailure,
-        format!("DemoTooLarge: {} sampled ticks > max {}", wanted_ticks_i32.len(), self.max_demo_ticks),
+        format!("DemoTooLarge: {} sampled ticks > max {}", sampled_ticks_i32.len(), self.max_demo_ticks),
       ));
     }
+    let sampled_ticks_set: AHashSet<i32> = sampled_ticks_i32.iter().copied().collect();
 
-    // ONE ST sampled parse -> raw columnar df, feeding BOTH replay chunks (encode from columns) and
-    // compute_stats (SoA JSON). round tuples in ORIGINAL rounds order (build_replay_chunks output
-    // preserves it, matching compute.ts buildReplayChunks iterating `rounds`).
-    let (tick_df, tick_prop_infos) = run_parse_ticks_raw(&self.path, sampled_tick_fields(), wanted_ticks_i32)?;
+    let raw_kills_for_aim: Vec<parser::compute_aim::RawAimKillRow> =
+      serde_json::from_value(Value::Array(raw_kills_arr.clone())).map_err(io_err)?;
+    let aim_wanted_ticks = parser::compute_aim::compute_aim_wanted_ticks(&raw_kills_for_aim);
+    let aim_ticks_set: AHashSet<i32> = aim_wanted_ticks.iter().map(|t| *t as i32).collect();
+
+    let sampled_fields = sampled_tick_fields();
+    let aim_fields = aim_tick_fields();
+    let mut union_fields = sampled_fields.clone();
+    for f in &aim_fields {
+      if !union_fields.contains(f) {
+        union_fields.push(f.clone());
+      }
+    }
+    let mut union_ticks_set: AHashSet<i32> = sampled_ticks_set.clone();
+    union_ticks_set.extend(aim_ticks_set.iter().copied());
+    let union_ticks: Vec<i32> = union_ticks_set.into_iter().collect();
+
+    // velocity_tick_filter = sampled cadence only: aim_tick_fields() never requests velocity, so
+    // only the sampled view's velocity_X/Y/Z deltas need protecting from the aim window's denser
+    // interleaved ticks (see velocity_tick_filter doc comment on SecondPassParser).
+    let merged = run_parse_ticks_pass(&self.path, &huf, union_fields, union_ticks, sampled_ticks_set.clone())?;
+    let tickrate = merged.tickrate as i64;
+
+    // ReplayChunk: slice RAW columns for just the sampled cadence straight from `merged` (no extra
+    // demo walk). round tuples in ORIGINAL rounds order (build_replay_chunks output preserves it,
+    // matching compute.ts buildReplayChunks iterating `rounds`).
+    let (tick_df, tick_prop_infos) = slice_tick_columns(&merged, &sampled_fields, &sampled_ticks_set);
     let round_tuples: Vec<(i64, i64, i64)> =
       events_result.rounds.iter().map(|r| (r.round_number, r.start_tick, r.end_tick)).collect();
     let replay_chunks =
@@ -414,14 +473,10 @@ impl Task for FullPipelineTask {
       parser::compute_stats::normalize_ticks(&tick_data_val)
     };
 
-    // 4) cửa sổ aim (AIM_TICK_FIELDS, AoS) -- tick quanh mỗi kill "engagement thật".
-    let raw_kills_for_aim: Vec<parser::compute_aim::RawAimKillRow> =
-      serde_json::from_value(Value::Array(raw_kills_arr.clone())).map_err(io_err)?;
-    let aim_wanted_ticks = parser::compute_aim::compute_aim_wanted_ticks(&raw_kills_for_aim);
-    let aim_tick_rows_val = if aim_wanted_ticks.is_empty() {
+    let aim_tick_rows_val = if aim_ticks_set.is_empty() {
       Value::Array(vec![])
     } else {
-      run_parse_ticks(&self.path, aim_tick_fields(), aim_wanted_ticks.iter().map(|t| *t as i32).collect(), false)?
+      extract_tick_view(&merged, &aim_fields, &aim_ticks_set, false)?
     };
     let aim_tick_rows: Vec<parser::compute_aim::RawAimTickRow> = serde_json::from_value(aim_tick_rows_val).map_err(io_err)?;
 
@@ -435,23 +490,16 @@ impl Task for FullPipelineTask {
     );
     let aim_result = parser::compute_aim::compute_aim_stats(&raw_kills_for_aim, &weapon_fire_batch, &aim_tick_rows);
 
-    // 6) meta (map/tickrate/duration) -- header parse. matchDate is NOT known to Rust (upload-time
-    // user choice) -> Node injects it into meta after the call. Mirrors compute.ts:70-72.
+    // 6) meta (map/duration) -- header parse for map name only; tickrate comes from `merged`
+    // (A0, detected during the tick pass itself -- see plan-128tick-tick-decode-optimization.md
+    // "Một nguồn sự thật") rather than re-parsing it out of the header string map. matchDate is NOT
+    // known to Rust (upload-time user choice) -> Node injects it into meta after the call. Mirrors
+    // compute.ts:70-72.
     let header = run_parse_header(&self.path)?;
     let map_name = match header.get("map_name") {
       Some(m) if !m.is_empty() => m.clone(),
       _ => "unknown".to_string(),
     };
-    let tickrate_raw = header
-      .get("tickrate")
-      .or_else(|| header.get("tick_rate"))
-      .and_then(|s| s.parse::<f64>().ok())
-      .filter(|v| *v != 0.0)
-      .unwrap_or(64.0);
-    let mut tickrate = tickrate_raw.round() as i64;
-    if tickrate == 0 {
-      tickrate = 64;
-    }
     let duration: Option<f64> = if last_tick > 0 {
       format!("{:.1}", last_tick as f64 / tickrate as f64).parse::<f64>().ok()
     } else {
@@ -521,4 +569,187 @@ pub fn compute_full_pipeline_async(
     zstd_level.unwrap_or(3),
     max_demo_ticks.unwrap_or(i64::MAX),
   ))
+}
+
+// plan-128tick-tick-decode-optimization.md B1 gate: "parity byte-identical cả sampled-output lẫn
+// aim-output" -- `legacy_run_parse_ticks` below is a byte-for-byte copy of the PRE-fusion
+// `run_parse_ticks` (two fully independent second-pass walks), kept ONLY as the oracle this test
+// diffs the new merged-pass output against. Not called from production code.
+#[cfg(test)]
+mod b1_tick_fusion_parity {
+  use super::*;
+
+  const TEST_DEMO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../parser/test_demo.dem");
+
+  fn legacy_run_parse_ticks(path: &str, huf: &Vec<(u8, u8)>, wanted_props: Vec<String>, wanted_ticks: Vec<i32>, struct_of_arrays: bool) -> Value {
+    let real_names = rm_user_friendly_names(&wanted_props).unwrap();
+    let mut real_name_to_og_name = AHashMap::default();
+    for (real_name, og) in real_names.iter().zip(&wanted_props) {
+      real_name_to_og_name.insert(real_name.clone(), og.clone());
+    }
+    let mmap = mmap_path(path).unwrap();
+    let settings = ParserInputs {
+      real_name_to_og_name,
+      wanted_players: vec![],
+      wanted_player_props: real_names.clone(),
+      wanted_other_props: vec![],
+      wanted_events: vec![],
+      wanted_prop_states: AHashMap::default(),
+      parse_ents: true,
+      wanted_ticks,
+      parse_projectiles: false,
+      only_header: false,
+      list_props: false,
+      only_convars: false,
+      huffman_lookup_table: huf,
+      order_by_steamid: false,
+      fallback_bytes: None,
+      parse_grenades: false,
+    };
+    let mut parser = Parser::new(settings, ParsingMode::Normal);
+    let output = parser.parse_demo(&mmap).unwrap();
+    let mut prop_infos = output.prop_controller.prop_infos.clone();
+    prop_infos.sort_by_key(|x| x.prop_name.clone());
+    let helper = OutputSerdeHelperStruct { prop_infos, inner: output.df.clone().into() };
+    if struct_of_arrays {
+      serde_json::to_value(&helper).unwrap()
+    } else {
+      serde_json::to_value(&soa_to_aos(helper)).unwrap()
+    }
+  }
+
+  #[test]
+  fn merged_tick_pass_matches_two_separate_passes() {
+    let huf = create_huffman_lookup_table();
+
+    let sampled_fields = sampled_tick_fields();
+    let aim_fields = aim_tick_fields();
+
+    // Two synthetic dense windows, deliberately NOT 8-aligned so they interleave with the sampled
+    // cadence at odd offsets -- this is exactly the boundary a naive merge would corrupt (sampled
+    // velocity_X/Y/Z picking up an aim-only row as its "previous tick").
+    let aim_ticks: Vec<i32> = (503..=567).chain(3003..=3067).collect();
+    let aim_ticks_set: AHashSet<i32> = aim_ticks.iter().copied().collect();
+
+    let sampled_ticks: Vec<i32> = (0..=4000).step_by(8).collect();
+    let sampled_ticks_set: AHashSet<i32> = sampled_ticks.iter().copied().collect();
+
+    // --- oracle: two fully separate second-pass walks (pre-B1 behaviour) ---
+    let legacy_sampled = legacy_run_parse_ticks(TEST_DEMO, &huf, sampled_fields.clone(), sampled_ticks.clone(), true);
+    let legacy_aim = legacy_run_parse_ticks(TEST_DEMO, &huf, aim_fields.clone(), aim_ticks.clone(), false);
+
+    // --- new: one merged walk, split via extract_tick_view ---
+    let mut union_fields = sampled_fields.clone();
+    for f in &aim_fields {
+      if !union_fields.contains(f) {
+        union_fields.push(f.clone());
+      }
+    }
+    let mut union_ticks_set = sampled_ticks_set.clone();
+    union_ticks_set.extend(aim_ticks_set.iter().copied());
+    let union_ticks: Vec<i32> = union_ticks_set.into_iter().collect();
+
+    let merged = run_parse_ticks_pass(TEST_DEMO, &huf, union_fields, union_ticks, sampled_ticks_set.clone()).unwrap();
+    let new_sampled = extract_tick_view(&merged, &sampled_fields, &sampled_ticks_set, true).unwrap();
+    let new_aim = extract_tick_view(&merged, &aim_fields, &aim_ticks_set, false).unwrap();
+
+    assert_eq!(legacy_sampled, new_sampled, "sampled view diverged after tick-pass fusion");
+    assert_eq!(legacy_aim, new_aim, "aim view diverged after tick-pass fusion");
+  }
+
+  // Sanity companion: with NO aim window at all (union == sampled), the merge must still match --
+  // covers the common real-world case of a demo with zero valid engagements.
+  #[test]
+  fn merged_tick_pass_matches_when_aim_window_empty() {
+    let huf = create_huffman_lookup_table();
+    let sampled_fields = sampled_tick_fields();
+    let sampled_ticks: Vec<i32> = (0..=4000).step_by(8).collect();
+    let sampled_ticks_set: AHashSet<i32> = sampled_ticks.iter().copied().collect();
+
+    let legacy_sampled = legacy_run_parse_ticks(TEST_DEMO, &huf, sampled_fields.clone(), sampled_ticks.clone(), true);
+
+    let merged = run_parse_ticks_pass(TEST_DEMO, &huf, sampled_fields.clone(), sampled_ticks.clone(), sampled_ticks_set.clone()).unwrap();
+    let new_sampled = extract_tick_view(&merged, &sampled_fields, &sampled_ticks_set, true).unwrap();
+
+    assert_eq!(legacy_sampled, new_sampled, "sampled view diverged with an empty aim window");
+  }
+
+  // A0 sanity: test_demo.dem is a 64-tick demo -- detected tickrate must come out at 64, not the
+  // hard-coded fallback silently masking a broken CsvcMsgServerInfo.tick_interval read.
+  #[test]
+  fn tickrate_detected_as_64_on_64tick_fixture() {
+    let huf = create_huffman_lookup_table();
+    let merged = run_parse_ticks_pass(TEST_DEMO, &huf, sampled_tick_fields(), vec![0, 8, 16], AHashSet::from_iter([0, 8, 16])).unwrap();
+    assert_eq!(merged.tickrate, 64);
+  }
+
+  // Real 128-tick fixture (pro POV, not checked into git -- huge). Not run by a plain
+  // `cargo test`; opt in with:
+  //   CS2_128TICK_DEMO=/path/to/demo.dem cargo test --lib -- --ignored 128tick
+  #[test]
+  #[ignore]
+  fn tickrate_and_c4_timer_sanity_on_real_128tick_demo() {
+    let Ok(path) = std::env::var("CS2_128TICK_DEMO") else {
+      panic!("set CS2_128TICK_DEMO=/path/to/demo.dem to run this test");
+    };
+    let huf = create_huffman_lookup_table();
+    let mmap = mmap_path(&path).unwrap();
+    let settings = ParserInputs {
+      real_name_to_og_name: AHashMap::default(),
+      wanted_players: vec![],
+      wanted_player_props: vec![],
+      wanted_other_props: vec![],
+      wanted_prop_states: AHashMap::default(),
+      wanted_events: vec!["bomb_planted".to_string(), "bomb_exploded".to_string()],
+      parse_ents: true,
+      wanted_ticks: vec![],
+      parse_projectiles: false,
+      only_header: true,
+      list_props: false,
+      only_convars: false,
+      huffman_lookup_table: &huf,
+      order_by_steamid: false,
+      fallback_bytes: None,
+      parse_grenades: false,
+    };
+    let mut parser = Parser::new(settings, ParsingMode::Normal);
+    let output = parser.parse_demo(&mmap).unwrap();
+
+    eprintln!("detected tickrate={}", output.tickrate);
+
+    // C4 timer sanity (plan gate §6): (bomb_exploded.tick - bomb_planted.tick) / tickrate ≈ 40s.
+    // NOTE: on the real "128tick" G2 vs Spirit fixtures this ended up empirically confirming the
+    // plan's own open question (§7) -- CsvcMsgServerInfo.tick_interval on these GOTV demos reads
+    // as 1/64 (tickrate=64), and every plant->explode delta is a constant 2624 ticks, which is
+    // 41.0s at the 64 interpretation vs a nonsensical 20.5s at 128. So despite the folder name,
+    // these particular demo files are NOT a genuine 128-tick sample by the metric that actually
+    // matters (the recorded tick encoding) -- GOTV recording rate can differ from the server's
+    // matchmaking-advertised tickrate. Assert against whatever tickrate was ACTUALLY detected,
+    // not a hard-coded 128, so this test still catches a real off-by-2x bug on a genuine 128-tick
+    // sample later without special-casing this fixture.
+    let planted: Vec<i32> = output.game_events.iter().filter(|e| e.name == "bomb_planted").map(|e| e.tick).collect();
+    let exploded: Vec<i32> = output.game_events.iter().filter(|e| e.name == "bomb_exploded").map(|e| e.tick).collect();
+    assert!(!planted.is_empty(), "no bomb_planted events found -- wrong fixture?");
+    assert!(!exploded.is_empty(), "no bomb_exploded events found -- pick a round where the bomb actually detonated");
+
+    for &exp_tick in &exploded {
+      let plant_tick = planted.iter().filter(|&&p| p <= exp_tick).max().copied().expect("no bomb_planted preceding this explosion");
+      let delta_ticks = exp_tick - plant_tick;
+      let secs_at_detected = delta_ticks as f64 / output.tickrate as f64;
+      let secs_at_half = delta_ticks as f64 / (output.tickrate as f64 / 2.0);
+      eprintln!(
+        "plant={plant_tick} explode={exp_tick} delta_ticks={delta_ticks} -> {secs_at_detected:.3}s@detected({}) {secs_at_half:.3}s@half",
+        output.tickrate,
+      );
+      // Loose absolute bound (some leagues/offsets push this a little past 40) PLUS a relative
+      // check that the detected tickrate is unambiguously the better fit than half its value --
+      // catches a genuine 2x tickrate misdetection even if the absolute C4 constant isn't 40.0.
+      assert!((secs_at_detected - 40.0).abs() < 2.0, "C4 timer implausible at detected tickrate: {secs_at_detected:.2}s");
+      assert!(
+        (secs_at_detected - 40.0).abs() < (secs_at_half - 40.0).abs(),
+        "detected tickrate({}) fits the C4 timer WORSE than half its value -- likely a 2x tickrate misdetection",
+        output.tickrate
+      );
+    }
+  }
 }

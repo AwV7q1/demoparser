@@ -650,9 +650,10 @@ pub fn parse_ticks_force_st(
 
 /// ADR-007 Giai đoạn 3 parity-debug ONLY: like `parse_ticks` but forces
 /// `ParsingMode::ForceSingleThreaded` AND honors `wanted_ticks` (the sampled subset). Mirrors the
-/// full-pipeline's internal `run_parse_ticks_raw` exactly, so a TS `computeMatchData` baseline can
-/// be fed the SAME ST sampled ticks the Rust pipeline uses -> replay-chunk/stats parity is
-/// apples-to-apples (not ST-pipeline vs MT-default-bulk). Prop_infos sorted by prop_name to match.
+/// full-pipeline's internal `slice_tick_columns`-fed sampled view exactly, so a TS
+/// `computeMatchData` baseline can be fed the SAME ST sampled ticks the Rust pipeline uses ->
+/// replay-chunk/stats parity is apples-to-apples (not ST-pipeline vs MT-default-bulk). Prop_infos
+/// sorted by prop_name to match.
 #[napi]
 pub fn parse_ticks_sampled_st(
   path_or_buf: Either<String, Buffer>,

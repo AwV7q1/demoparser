@@ -33,6 +33,11 @@ pub struct SecondPassParser<'a> {
     pub cls_by_id: &'a Vec<Class>,
     pub stringtable_players: BTreeMap<i32, UserInfo>,
     pub net_tick: u32,
+    // ADR-007 128-tick support: detected from CsvcMsgServerInfo.tick_interval (second_pass::parser::parse_server_info),
+    // NOT available in the header-only first pass. Defaults to 64 (guard >0) until that message is seen; every MT
+    // second-pass worker re-derives it independently the same way it re-derives cls_bits (full packets re-embed
+    // ServerInfo, see parse_full_packet_stringtables).
+    pub tickrate: u32,
     pub parse_inventory: bool,
     pub paths: Vec<FieldPath>,
     pub ptr: usize,
@@ -82,6 +87,14 @@ pub struct SecondPassParser<'a> {
     // the boundary tick's props are included in the departing round's chunk.
     pub round_boundary_hit: bool,
     pub round_flush: Option<Box<dyn FnMut(RoundFlushChunk)>>,
+    // ADR-007 tick-pass fusion (B1): when Some, restricts the "previous collected tick" search
+    // used by velocity (collect_data.rs find_last_coordinate_idx/find_most_recent_coordinate_idx)
+    // to rows whose tick is in this set. Needed only when `wanted_ticks` is a UNION of two
+    // different cadences (e.g. sampled-every-8 ∪ dense-aim-window) sharing one self.output -- an
+    // aim-only tick interleaved between two sampled ticks would otherwise be picked up as the
+    // "previous" row and corrupt the sampled view's velocity delta. None (default, every existing
+    // call site) preserves current behaviour exactly -- no filtering beyond `wanted_ticks` itself.
+    pub velocity_tick_filter: Option<AHashSet<i32>>,
 }
 
 /// One round's worth of drained accumulator state, handed to the `round_flush` callback so the
@@ -171,6 +184,7 @@ impl<'a> SecondPassParser<'a> {
             df_per_player: self.df_per_player,
             entities: self.entities,
             last_tick: self.tick,
+            tickrate: self.tickrate,
         }
     }
     pub fn new(
@@ -204,6 +218,7 @@ impl<'a> SecondPassParser<'a> {
             ],
             parse_inventory: first_pass_output.prop_controller.wanted_player_props.contains(&"inventory".to_string()),
             net_tick: 0,
+            tickrate: 64,
             c4_entity_id: None,
             stringtable_players: first_pass_output.stringtable_players,
             is_debug_mode: debug,
@@ -244,6 +259,7 @@ impl<'a> SecondPassParser<'a> {
             list_props: first_pass_output.list_props,
             round_boundary_hit: false,
             round_flush: None,
+            velocity_tick_filter: None,
         })
     }
 

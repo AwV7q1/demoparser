@@ -145,7 +145,7 @@ impl<'a> SecondPassParser<'a> {
             PropType::Button => return self.get_button_prop(&prop_info, &entity_id),
             PropType::Controller => return self.get_controller_prop(&prop_info.id, player),
             PropType::Rules => return self.get_rules_prop(prop_info),
-            PropType::GameTime => return Ok(Variant::F32(self.net_tick as f32 / 64.0)),
+            PropType::GameTime => return Ok(Variant::F32(self.net_tick as f32 / self.tickrate as f32)),
         }
     }
     pub fn get_prop_from_ent(&self, prop_id: &u32, entity_id: &i32) -> Result<Variant, PropCollectionError> {
@@ -651,8 +651,17 @@ impl<'a> SecondPassParser<'a> {
     fn find_most_recent_coordinate_idx(&self, optv: Option<&PropColumn>, wanted_steamid: u64) -> Option<usize> {
         if let Some(v) = optv {
             if let Some(VarVec::U64(steamid_vec)) = &v.data {
+                // NOTE: by the time velocity is computed for "the current tick", this row's own
+                // steamid/tick usually hasn't been pushed to self.output yet (VELOCITY_*_ID is
+                // registered before TICK_ID/STEAMID_ID in prop_infos -- see set_custom_propinfos),
+                // so "most recent" here really means "last previously-collected row", same
+                // cross-cadence contamination risk as find_last_coordinate_idx below.
+                let tick_col = match &self.velocity_tick_filter {
+                    Some(_) => self.output.get(&TICK_ID).and_then(|c| c.data.as_ref()),
+                    None => None,
+                };
                 for idx in (0..steamid_vec.len()).rev() {
-                    if steamid_vec[idx] == Some(wanted_steamid) {
+                    if steamid_vec[idx] == Some(wanted_steamid) && self.velocity_tick_allowed(tick_col, idx) {
                         return Some(idx);
                     }
                 }
@@ -664,14 +673,31 @@ impl<'a> SecondPassParser<'a> {
         let cur_idx = cur_idx?;
         if let VarVec::U64(steamid_vec) = optv?.data.as_ref()? {
             // iterate backwards until steamid is our wanted player and > 1sec ago
+            let tick_col = match &self.velocity_tick_filter {
+                Some(_) => self.output.get(&TICK_ID).and_then(|c| c.data.as_ref()),
+                None => None,
+            };
             for idx in (0..steamid_vec.len()).rev() {
                 let sid = steamid_vec[idx];
-                if sid == Some(wanted_steamid) && idx != cur_idx {
+                if sid == Some(wanted_steamid) && idx != cur_idx && self.velocity_tick_allowed(tick_col, idx) {
                     return Some(idx);
                 }
             }
         }
         None
+    }
+    // See `SecondPassParser::velocity_tick_filter` doc comment: when a merged tick-pass unions
+    // two cadences into one `wanted_ticks`, this keeps the "previous row" search for velocity
+    // restricted to rows belonging to the SAME cadence as the row currently being computed.
+    #[inline]
+    fn velocity_tick_allowed(&self, tick_col: Option<&VarVec>, idx: usize) -> bool {
+        match &self.velocity_tick_filter {
+            None => true,
+            Some(set) => match tick_col {
+                Some(VarVec::I32(v)) => v.get(idx).copied().flatten().map_or(false, |t| set.contains(&t)),
+                _ => false,
+            },
+        }
     }
     fn find_wanted_indicies(&self, optv: Option<&PropColumn>, wanted_steamid: u64) -> Vec<usize> {
         let idx1 = self.find_most_recent_coordinate_idx(optv, wanted_steamid);
