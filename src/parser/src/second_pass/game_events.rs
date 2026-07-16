@@ -311,7 +311,7 @@ impl<'a> SecondPassParser<'a> {
                 PropType::Team => self.find_other_team_props(&prop_info),
                 PropType::Rules => self.find_other_rules_props(&prop_info),
                 PropType::GameTime => vec![EventField {
-                    data: Some(Variant::F32(self.net_tick as f32 / 64.0)),
+                    data: Some(Variant::F32(self.net_tick as f32 / self.tickrate as f32)),
                     name: "game_time".to_string(),
                 }],
                 _ => vec![],

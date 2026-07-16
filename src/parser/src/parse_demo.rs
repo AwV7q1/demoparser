@@ -43,11 +43,16 @@ pub struct DemoOutput {
     pub voice_data: Vec<(i32, CsvcMsgVoiceData)>,
     pub prop_controller: PropController,
     pub df_per_player: AHashMap<u64, AHashMap<u32, PropColumn>>,
+    // ADR-007 128-tick support -- see SecondPassParser::tickrate for detection details.
+    pub tickrate: u32,
 }
 
 pub struct Parser<'a> {
     input: ParserInputs<'a>,
     pub parsing_mode: ParsingMode,
+    // ADR-007 tick-pass fusion (B1) -- forwarded onto every SecondPassParser this Parser
+    // constructs; see SecondPassParser::velocity_tick_filter for why this exists.
+    velocity_tick_filter: Option<AHashSet<i32>>,
 }
 #[derive(PartialEq)]
 pub enum ParsingMode {
@@ -61,7 +66,16 @@ impl<'a> Parser<'a> {
         Parser {
             input: input,
             parsing_mode: parsing_mode,
+            velocity_tick_filter: None,
         }
+    }
+    /// See `SecondPassParser::velocity_tick_filter` -- restricts the "previous collected tick"
+    /// search used by velocity computation to `filter`, so a caller can safely request a UNION
+    /// of two different tick cadences (e.g. sampled ∪ dense-aim-window) in one `wanted_ticks`
+    /// without one cadence's rows corrupting the other's velocity deltas.
+    pub fn with_velocity_tick_filter(mut self, filter: AHashSet<i32>) -> Self {
+        self.velocity_tick_filter = Some(filter);
+        self
     }
     pub fn parse_demo(&mut self, demo_bytes: &[u8]) -> Result<DemoOutput, DemoParserError> {
         let _prof = std::env::var("CS2_PROF").is_ok();
@@ -88,6 +102,7 @@ impl<'a> Parser<'a> {
             .par_iter()
             .map(|offset| {
                 let mut parser = SecondPassParser::new(first_pass_output.clone(), *offset, false, None)?;
+                parser.velocity_tick_filter = self.velocity_tick_filter.clone();
                 parser.start(outer_bytes)?;
                 Ok(parser.create_output())
             })
@@ -134,6 +149,7 @@ impl<'a> Parser<'a> {
         let prof = std::env::var("CS2_PROF").is_ok();
         let mut t = std::time::Instant::now();
         let mut parser = SecondPassParser::new(first_pass_output.clone(), 16, true, None)?;
+        parser.velocity_tick_filter = self.velocity_tick_filter.clone();
         parser.start(outer_bytes)?;
         if prof { eprintln!("[prof] second_pass start(): {:.3}s", t.elapsed().as_secs_f64()); t = std::time::Instant::now(); }
         let second_pass_output = parser.create_output();
@@ -168,8 +184,10 @@ impl<'a> Parser<'a> {
                         }
                     }
                     let my_first_out = first_pass_output.clone();
+                    let velocity_tick_filter = self.velocity_tick_filter.clone();
                     handles.push(s.spawn(move || {
                         let mut parser = SecondPassParser::new(my_first_out, start_end_offset.start, false, Some(start_end_offset))?;
+                        parser.velocity_tick_filter = velocity_tick_filter;
                         parser.start(outer_bytes)?;
                         Ok(parser.create_output())
                     }));
@@ -209,6 +227,7 @@ impl<'a> Parser<'a> {
             .par_iter()
             .map(|offset| {
                 let mut parser = SecondPassParser::new(first_pass_output.clone(), *offset, false, None)?;
+                parser.velocity_tick_filter = self.velocity_tick_filter.clone();
                 parser.start(outer_bytes)?;
                 Ok(parser.create_output())
             })
@@ -350,6 +369,7 @@ impl<'a> Parser<'a> {
                 voice_data: output.voice_data,
                 df_per_player: pp,
                 uniq_prop_names: all_prop_names,
+                tickrate: output.tickrate,
             };
         }
 
@@ -366,8 +386,14 @@ impl<'a> Parser<'a> {
         let mut convars = AHashMap::default();
         let mut projectiles = Vec::new();
         let mut voice_data = Vec::new();
+        // max(): a worker that never saw CsvcMsgServerInfo (shouldn't happen -- full packets
+        // re-embed it, see parse_full_packet_stringtables) would stay at the 64 fallback; take
+        // the max so one correctly-detected 128 wins over a stale default rather than the other
+        // way round.
+        let mut tickrate: u32 = 64;
 
         for output in outputs {
+            tickrate = tickrate.max(output.tickrate);
             dfs.push(output.df);
             for event_name in output.game_events_counter {
                 all_game_events.insert(event_name);
@@ -426,6 +452,7 @@ impl<'a> Parser<'a> {
             voice_data,
             df_per_player: pp,
             uniq_prop_names: all_prop_names,
+            tickrate,
         }
     }
 

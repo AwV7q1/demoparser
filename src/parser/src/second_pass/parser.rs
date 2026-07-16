@@ -71,6 +71,7 @@ pub struct SecondPassOutput {
     pub df_per_player: AHashMap<u64, AHashMap<u32, PropColumn>>,
     pub entities: Vec<Option<Entity>>,
     pub last_tick: i32,
+    pub tickrate: u32,
 }
 impl<'a> SecondPassParser<'a> {
     pub fn start(&mut self, demo_bytes: &'a [u8]) -> Result<(), DemoParserError> {
@@ -432,6 +433,12 @@ impl<'a> SecondPassParser<'a> {
         };
         let class_count = server_info.max_classes();
         self.cls_bits = Some((class_count as f32 + 1.).log2().ceil() as u32);
+        // ADR-007 128-tick support: tick_interval is the seconds-per-tick (e.g. 1/64, 1/128) --
+        // only present in the packet stream (this message), never in the header-only first pass.
+        let tick_interval = server_info.tick_interval();
+        if tick_interval > 0.0 {
+            self.tickrate = (1.0 / tick_interval).round() as u32;
+        }
         Ok(())
     }
     pub fn parse_user_command_cmd(&mut self, _data: &[u8]) -> Result<(), DemoParserError> {
