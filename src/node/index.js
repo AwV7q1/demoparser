@@ -310,9 +310,10 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { computeFullPipelineAsync, JsVariant, WantedPropState, parseVoice, listGameEvents, parseGrenades, parseHeader, parseEvent, parseEvents, parseTicks, parseTicksForceSt, parseTicksSampledSt, parseTicksStreaming, parseTicksStreamingToFile, parsePlayerInfo, parsePlayerSkins, computeEvents, computeStats, computeAimStats, listUpdatedFields } = nativeBinding
+const { computeFullPipelineAsync, computeFullPipelineAsyncBuf, JsVariant, WantedPropState, parseVoice, listGameEvents, parseGrenades, parseHeader, parseEvent, parseEvents, parseTicks, parseTicksForceSt, parseTicksSampledSt, parseTicksStreaming, parseTicksStreamingToFile, parsePlayerInfo, parsePlayerSkins, computeEvents, computeStats, computeAimStats, listUpdatedFields } = nativeBinding
 
 module.exports.computeFullPipelineAsync = computeFullPipelineAsync
+module.exports.computeFullPipelineAsyncBuf = computeFullPipelineAsyncBuf
 module.exports.JsVariant = JsVariant
 module.exports.WantedPropState = WantedPropState
 module.exports.parseVoice = parseVoice
