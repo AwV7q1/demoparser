@@ -9,6 +9,8 @@ use crate::second_pass::entities::EntityType;
 use crate::second_pass::parser_settings::SecondPassParser;
 use crate::second_pass::variants::PropColumn;
 use crate::second_pass::variants::VarVec;
+use ahash::AHashMap;
+use ahash::AHashSet;
 use csgoproto::maps::AGENTSMAP;
 use csgoproto::maps::PAINTKITS;
 use csgoproto::maps::STICKER_ID_TO_NAME;
@@ -706,6 +708,50 @@ impl<'a> SecondPassParser<'a> {
             return vec![idx1, idx2];
         }
         vec![]
+    }
+
+    // ADR-007 (4) online-aggregate: rows this round-flush is about to drain from `self.output`
+    // that must be CARRIED into the next round's self.output, so velocity at the start of the
+    // next round can still find its "previous row" -- without this, a full clear at every round
+    // boundary reproduces the documented Gotcha #2 (velocity silently nulls/zeros at the first
+    // rows of every round). Reuses `find_wanted_indicies` (the EXACT same selection algorithm
+    // velocity computation itself uses, including `velocity_tick_filter` cadence restriction) for
+    // every distinct steamid present, rather than re-deriving the "which rows matter" logic --
+    // this is the whole reason continuity is provably identical to the un-flushed (whole-match)
+    // baseline: it isn't a new selection rule, it's the SAME rule applied pre-emptively.
+    // MUST be called BEFORE draining `self.output` (reads `self.output` directly).
+    pub fn compute_velocity_carry_indices(&self) -> Vec<usize> {
+        let steamid_col = self.output.get(&STEAMID_ID);
+        let Some(VarVec::U64(steamid_vec)) = steamid_col.and_then(|c| c.data.as_ref()) else {
+            return vec![];
+        };
+        let mut distinct: AHashSet<u64> = AHashSet::default();
+        for s in steamid_vec.iter().flatten() {
+            distinct.insert(*s);
+        }
+        let mut carry: AHashSet<usize> = AHashSet::default();
+        for &sid in &distinct {
+            for idx in self.find_wanted_indicies(steamid_col, sid) {
+                carry.insert(idx);
+            }
+        }
+        let mut v: Vec<usize> = carry.into_iter().collect();
+        v.sort_unstable();
+        v
+    }
+
+    // Rebuilds a small `self.output`-shaped map from just the carried row indices of `full` (the
+    // just-drained round). Slicing every column (not just steamid/tick/coords) keeps the result a
+    // structurally valid `self.output` for whatever the next round's collection expects to find --
+    // cheap since `indices` is at most 2 rows/player.
+    pub fn carry_rows(full: &AHashMap<u32, PropColumn>, indices: &[usize]) -> AHashMap<u32, PropColumn> {
+        let mut out = AHashMap::default();
+        for (id, col) in full {
+            if let Some(sliced) = col.slice_to_new(indices) {
+                out.insert(*id, sliced);
+            }
+        }
+        out
     }
 
     fn velocity_from_indicies(&self, indicies: &[usize], axis: CoordinateAxis) -> Result<Variant, PropCollectionError> {

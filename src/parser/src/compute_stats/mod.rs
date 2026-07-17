@@ -27,6 +27,11 @@ pub use types::{
 pub use ordered_map::OrderedMap;
 // ADR-007 §VI.2u lever ②: full_pipeline normalize sớm rồi drop Value+helper trước compute nặng.
 pub use tick_normalize::normalize_ticks;
+// ADR-007 (4) online-aggregate: exposed directly (not just via compute_stats_rows) so a per-round
+// streaming caller can invoke it once per round with a single-element `rounds` slice, instead of
+// pulling in weapon_fire_batch/hurt_batch/raw_kills/raw_hurt/player_info that survivor/zone/economy
+// never read.
+pub use tick_aggregates::compute_tick_aggregates;
 
 use crate::compute_events::ParsedRound;
 use serde_json::Value;

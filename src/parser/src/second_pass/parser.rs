@@ -256,14 +256,25 @@ impl<'a> SecondPassParser<'a> {
                             // ADR-007 §VI.2 streaming prototype: this tick's props are already in
                             // self.output (collect_entities() above), so draining here includes the
                             // round-end tick in the departing round's chunk.
-                            if self.round_boundary_hit {
+                            //
+                            // ADR-007 (4): `round_boundary_hit` (internal GameRulesProxy prop
+                            // watching) proved unreliable in testing -- OR'd with
+                            // `flush_at_ticks` (externally-supplied real round-end ticks from an
+                            // events-pass call), which is the trigger (4) actually relies on.
+                            let hit_external_boundary = self.flush_at_ticks.as_ref().map_or(false, |ticks| ticks.contains(&self.tick));
+                            if self.round_boundary_hit || hit_external_boundary {
                                 self.round_boundary_hit = false;
                                 if self.round_flush.is_some() {
+                                    // ADR-007 (4) online-aggregate: compute velocity carry-forward
+                                    // BEFORE draining -- see collect_data.rs
+                                    // `compute_velocity_carry_indices` doc comment.
+                                    let carry_indices = self.compute_velocity_carry_indices();
                                     let chunk = RoundFlushChunk {
                                         tick: self.tick,
                                         output: std::mem::take(&mut self.output),
                                         game_events: std::mem::take(&mut self.game_events),
                                     };
+                                    self.output = SecondPassParser::carry_rows(&chunk.output, &carry_indices);
                                     if let Some(cb) = self.round_flush.as_mut() {
                                         cb(chunk);
                                     }

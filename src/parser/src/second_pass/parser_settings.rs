@@ -85,8 +85,23 @@ pub struct SecondPassParser<'a> {
     // Streaming prototype (ADR-007 §VI.2): set by entities.rs when a round_end prop-change is
     // seen (ungated by wanted_events), consumed in parser.rs right after collect_entities() so
     // the boundary tick's props are included in the departing round's chunk.
+    //
+    // GOTCHA found in ADR-007 (4) work (2026-07-17): this internal GameRulesProxy prop-watching
+    // signal does NOT reliably fire -- `special_ids.round_end_count` stayed `None` through an
+    // entire real demo in testing (confirmed via a separate events-pass call that the SAME demo
+    // has real round_end events at real ticks) -- root cause not fully understood, and this path
+    // is dormant/prototype-only (only ever exercised by row-count-only benchmarks, never
+    // correctness-checked). Do NOT rely on this alone for round-boundary flushing; see
+    // `flush_at_ticks` below for the reliable alternative used by (4).
     pub round_boundary_hit: bool,
     pub round_flush: Option<Box<dyn FnMut(RoundFlushChunk)>>,
+    // ADR-007 (4) online-aggregate: reliable alternative to `round_boundary_hit` above -- an
+    // externally-supplied set of exact ticks to flush at (the real round-end ticks, obtained from
+    // a normal events-pass call -- production already computes these for Round.endTick, so this
+    // is free reuse, not new work). Checked at the SAME point `round_boundary_hit` is (right after
+    // `collect_entities()`, so the boundary tick's own row is included in the departing round's
+    // chunk), `OR`'d with `round_boundary_hit` rather than replacing it (harmless if both fire).
+    pub flush_at_ticks: Option<AHashSet<i32>>,
     // ADR-007 tick-pass fusion (B1): when Some, restricts the "previous collected tick" search
     // used by velocity (collect_data.rs find_last_coordinate_idx/find_most_recent_coordinate_idx)
     // to rows whose tick is in this set. Needed only when `wanted_ticks` is a UNION of two
@@ -259,6 +274,7 @@ impl<'a> SecondPassParser<'a> {
             list_props: first_pass_output.list_props,
             round_boundary_hit: false,
             round_flush: None,
+            flush_at_ticks: None,
             velocity_tick_filter: None,
         })
     }
@@ -267,6 +283,12 @@ impl<'a> SecondPassParser<'a> {
     /// accumulator drained so far (see [`RoundFlushChunk`]). Prototype-only (ADR-007 §VI.2).
     pub fn with_round_flush(mut self, cb: Box<dyn FnMut(RoundFlushChunk)>) -> Self {
         self.round_flush = Some(cb);
+        self
+    }
+    /// ADR-007 (4) online-aggregate: reliable round-boundary trigger -- see the field doc
+    /// comment on `flush_at_ticks`.
+    pub fn with_flush_at_ticks(mut self, ticks: AHashSet<i32>) -> Self {
+        self.flush_at_ticks = Some(ticks);
         self
     }
 }

@@ -53,6 +53,18 @@ pub struct Parser<'a> {
     // ADR-007 tick-pass fusion (B1) -- forwarded onto every SecondPassParser this Parser
     // constructs; see SecondPassParser::velocity_tick_filter for why this exists.
     velocity_tick_filter: Option<AHashSet<i32>>,
+    // ADR-007 (4) online-aggregate -- only forwarded on the ForceSingleThreaded path
+    // (`second_pass_single_threaded`). `Box<dyn FnMut>` isn't `Clone`, and round-boundary
+    // ordering isn't well-defined across the MT path's independently-parallel segments anyway,
+    // so this is intentionally NOT threaded into the multi-threaded branches (mirrors how
+    // `ParsingMode::ForceSingleThreaded` is already mandatory for the tick-pass fusion this
+    // exists to serve -- see full_pipeline.rs's `run_parse_ticks_pass` doc comment).
+    round_flush: Option<Box<dyn FnMut(RoundFlushChunk)>>,
+    // ADR-007 (4) online-aggregate: reliable round-boundary trigger (see
+    // `SecondPassParser::flush_at_ticks` doc comment for why this exists instead of relying on
+    // the internal `round_boundary_hit` prop-watching alone). Only forwarded on the
+    // ForceSingleThreaded path, same as `round_flush`.
+    flush_at_ticks: Option<AHashSet<i32>>,
 }
 #[derive(PartialEq)]
 pub enum ParsingMode {
@@ -67,6 +79,8 @@ impl<'a> Parser<'a> {
             input: input,
             parsing_mode: parsing_mode,
             velocity_tick_filter: None,
+            round_flush: None,
+            flush_at_ticks: None,
         }
     }
     /// See `SecondPassParser::velocity_tick_filter` -- restricts the "previous collected tick"
@@ -77,9 +91,29 @@ impl<'a> Parser<'a> {
         self.velocity_tick_filter = Some(filter);
         self
     }
+    /// ADR-007 (4) online-aggregate: called once per round boundary with that round's drained
+    /// tick data (see `RoundFlushChunk`), so a caller can encode+fold+free it immediately instead
+    /// of waiting for the whole match to accumulate. Only honored with
+    /// `ParsingMode::ForceSingleThreaded` (see the field doc comment on `Parser::round_flush`).
+    pub fn with_round_flush(mut self, cb: Box<dyn FnMut(RoundFlushChunk)>) -> Self {
+        self.round_flush = Some(cb);
+        self
+    }
+    /// ADR-007 (4) online-aggregate: see `SecondPassParser::flush_at_ticks` doc comment.
+    pub fn with_flush_at_ticks(mut self, ticks: AHashSet<i32>) -> Self {
+        self.flush_at_ticks = Some(ticks);
+        self
+    }
     pub fn parse_demo(&mut self, demo_bytes: &[u8]) -> Result<DemoOutput, DemoParserError> {
         let _prof = std::env::var("CS2_PROF").is_ok();
         let _t = std::time::Instant::now();
+        // ADR-007 (4) online-aggregate: extracted BEFORE any borrow of `self.input` below --
+        // `Box<dyn FnMut>` isn't `Sync`, so leaving it as a field read through `&self` inside the
+        // rayon `.map` closures (MT paths) would make `Parser` itself non-`Sync` and break their
+        // `Fn + Sync + Send` bound, even though those paths never use it (see the field doc
+        // comment). Taking it here, once, and threading it through only the ForceSingleThreaded
+        // branch as a plain value keeps every other branch untouched.
+        let round_flush = self.round_flush.take();
         let mut first_pass_parser = FirstPassParser::new(&self.input);
         let first_pass_output = first_pass_parser.parse_demo(demo_bytes, false)?;
         if _prof {
@@ -92,17 +126,18 @@ impl<'a> Parser<'a> {
         {
             return self.second_pass_multi_threaded(demo_bytes, first_pass_output);
         } else {
-            self.second_pass_single_threaded(demo_bytes, first_pass_output)
+            self.second_pass_single_threaded(demo_bytes, first_pass_output, round_flush, self.flush_at_ticks.clone())
         }
     }
 
     fn second_pass_multi_threaded(&self, outer_bytes: &[u8], first_pass_output: FirstPassOutput) -> Result<DemoOutput, DemoParserError> {
+        let velocity_tick_filter = self.velocity_tick_filter.clone();
         let second_pass_outputs: Vec<Result<SecondPassOutput, DemoParserError>> = first_pass_output
             .fullpacket_offsets
             .par_iter()
             .map(|offset| {
                 let mut parser = SecondPassParser::new(first_pass_output.clone(), *offset, false, None)?;
-                parser.velocity_tick_filter = self.velocity_tick_filter.clone();
+                parser.velocity_tick_filter = velocity_tick_filter.clone();
                 parser.start(outer_bytes)?;
                 Ok(parser.create_output())
             })
@@ -145,11 +180,21 @@ impl<'a> Parser<'a> {
         events.retain(|x|x.name != "player_first_connect");
         events.extend(ids.values().map(|x| x.clone()));
     }
-    fn second_pass_single_threaded(&self, outer_bytes: &[u8], first_pass_output: FirstPassOutput) -> Result<DemoOutput, DemoParserError> {
+    fn second_pass_single_threaded(
+        &self,
+        outer_bytes: &[u8],
+        first_pass_output: FirstPassOutput,
+        round_flush: Option<Box<dyn FnMut(RoundFlushChunk)>>,
+        flush_at_ticks: Option<AHashSet<i32>>,
+    ) -> Result<DemoOutput, DemoParserError> {
         let prof = std::env::var("CS2_PROF").is_ok();
         let mut t = std::time::Instant::now();
         let mut parser = SecondPassParser::new(first_pass_output.clone(), 16, true, None)?;
         parser.velocity_tick_filter = self.velocity_tick_filter.clone();
+        // ADR-007 (4) online-aggregate -- `Box<dyn FnMut>` isn't `Clone`, taken by value in
+        // `parse_demo` and threaded through as a plain parameter (see that call site's comment).
+        parser.round_flush = round_flush;
+        parser.flush_at_ticks = flush_at_ticks;
         parser.start(outer_bytes)?;
         if prof { eprintln!("[prof] second_pass start(): {:.3}s", t.elapsed().as_secs_f64()); t = std::time::Instant::now(); }
         let second_pass_output = parser.create_output();
@@ -222,12 +267,13 @@ impl<'a> Parser<'a> {
         })
     }
     fn second_pass_multi_threaded_no_channels(&self, outer_bytes: &[u8], first_pass_output: FirstPassOutput) -> Result<DemoOutput, DemoParserError> {
+        let velocity_tick_filter = self.velocity_tick_filter.clone();
         let second_pass_outputs: Vec<Result<SecondPassOutput, DemoParserError>> = first_pass_output
             .fullpacket_offsets
             .par_iter()
             .map(|offset| {
                 let mut parser = SecondPassParser::new(first_pass_output.clone(), *offset, false, None)?;
-                parser.velocity_tick_filter = self.velocity_tick_filter.clone();
+                parser.velocity_tick_filter = velocity_tick_filter.clone();
                 parser.start(outer_bytes)?;
                 Ok(parser.create_output())
             })
