@@ -691,7 +691,14 @@ mod b1_tick_fusion_parity {
       fallback_bytes: None,
       parse_grenades: false,
     };
-    let mut parser = Parser::new(settings, ParsingMode::Normal);
+    // NOTE: must match the REAL pre-fusion `run_parse_ticks`'s ParsingMode::ForceSingleThreaded
+    // (see full_pipeline.rs git history at 77105ff) -- ParsingMode::Normal auto-picks
+    // multi-threaded for this prop set (check_multithreadability), which nulls out
+    // velocity_X/Y/Z at fullpacket-segment boundaries (the exact gotcha run_parse_ticks_pass's
+    // own doc comment describes above). Using Normal here made this oracle diverge from real
+    // legacy behavior at wide tick ranges that cross a segment boundary, not just from the new
+    // fused code -- caught via a 0..=4000 sampled window landing on test_demo.dem's tail segment.
+    let mut parser = Parser::new(settings, ParsingMode::ForceSingleThreaded);
     let output = parser.parse_demo(&mmap).unwrap();
     let mut prop_infos = output.prop_controller.prop_infos.clone();
     prop_infos.sort_by_key(|x| x.prop_name.clone());
