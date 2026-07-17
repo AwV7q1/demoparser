@@ -27,10 +27,16 @@ pub struct RawEvent {
   pub tick: Option<i64>,
   #[serde(default)]
   pub total_rounds_played: Option<i64>,
+  // Untyped (not String): confirmed via real-demo testing (ADR-007 (4) work, 2026-07-17) that the
+  // Rust event decoder emits these as raw numeric codes (`winner`=team_num 2/3, `reason`=a round-
+  // end reason code) for round_end, NOT the "T"/"CT" string demoparser2's JS API returns -- typing
+  // these as `String` made deserialization panic the first time this dead-code path (see
+  // `compute_full_pipeline_core`, never wired into production) was actually exercised against a
+  // real demo. `Option<Value>` tolerates either shape; see rounds.rs for the numeric->name mapping.
   #[serde(default)]
-  pub winner: Option<String>,
+  pub winner: Option<Value>,
   #[serde(default)]
-  pub reason: Option<String>,
+  pub reason: Option<Value>,
 
   #[serde(default)]
   pub attacker_steamid: Option<String>,
