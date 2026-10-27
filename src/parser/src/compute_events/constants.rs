@@ -35,10 +35,19 @@ pub fn flash_fire_weapon() -> &'static [&'static str] {
   &["flashbang"]
 }
 
+// 'flashbang' không chứa chữ "grenade" nên phải liệt kê riêng (thiếu nó thì mỗi cú ném flash bị tính
+// là 1 phát bắn).
 pub fn non_gun() -> &'static [&'static str] {
   &[
-    "knife", "bayonet", "karambit", "grenade", "molotov", "incendiary", "decoy", "c4", "healthshot",
+    "knife", "bayonet", "karambit", "grenade", "flashbang", "molotov", "incendiary", "decoy", "c4", "healthshot",
   ]
+}
+
+/// Súng (bắn đạn) -- accuracy/đạn đạo chỉ tính các vũ khí này. Nhận tên thô hoặc đã chuẩn hoá;
+/// taser tính là súng. Port của isGunWeapon (constants.ts).
+pub fn is_gun_weapon(weapon: &str) -> bool {
+  let w = weapon.to_lowercase();
+  !w.is_empty() && !non_gun().iter().any(|k| w.contains(k))
 }
 pub fn non_bullet() -> &'static [&'static str] {
   &["inferno", "molotov", "incendiary", "smokegrenade", "decoy", "flashbang"]

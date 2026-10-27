@@ -96,6 +96,18 @@ pub struct MatchWeaponStat {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayerWeaponStat {
+  pub steam_id: String,
+  pub weapon: String,
+  pub kills: i64,
+  pub hs_kills: i64,
+  pub shots: i64,
+  pub hits: i64,
+  pub damage: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct HitDetail {
   pub hitgroup: i64,
   pub tick: i64,

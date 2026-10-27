@@ -28,6 +28,13 @@ fn main() -> Result<()> {
         "GameTracking-CS2/Protobufs/cs_gameevents.proto",
     ];
 
+    // Không có protoc (vd máy dev Windows) → dùng src/protobuf.rs đã commit thay vì fail build.
+    let has_protoc = std::env::var_os("PROTOC").is_some() || Command::new("protoc").arg("--version").output().is_ok();
+    if !has_protoc && std::path::Path::new("src/protobuf.rs").exists() {
+        println!("cargo::warning=protoc not found, using committed src/protobuf.rs");
+        return Ok(());
+    }
+
     prost_build::Config::new()
         .format(false)
         .out_dir("src")

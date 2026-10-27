@@ -29,6 +29,7 @@ pub use types::{HurtData, KillData, WeaponFireData};
 // Small stateless helpers reused as-is by compute_stats (norm_weapon_name/hitgroup_to_int/
 // clean_name/side_or_null) -- see helpers.rs.
 pub use helpers::{clean_name, hitgroup_to_int, norm_weapon_name, side_2_else_ct, side_or_null};
+pub use constants::is_gun_weapon;
 
 use replay_event_chunks::ReplayEventItem;
 use serde_json::Value;

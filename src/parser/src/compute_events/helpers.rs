@@ -72,3 +72,26 @@ pub fn side_or_null(team_num: Option<i64>) -> Option<String> {
 pub fn side_2_else_ct(team_num: Option<i64>) -> String {
   if team_num == Some(2) { "T".to_string() } else { "CT".to_string() }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use serde_json::json;
+
+  // Chuyển từ apps/api hitgroup-to-int.spec.ts (bản TS đã xoá).
+  #[test]
+  fn hitgroup_labels_map_to_cs2_codes() {
+    let hg = |v: Value| hitgroup_to_int(&Some(v));
+    let labels = [("head", 1), ("chest", 2), ("stomach", 3), ("left arm", 4), ("right arm", 5), ("left leg", 6), ("right leg", 7), ("neck", 8), ("gear", 10)];
+    for (label, code) in labels {
+      assert_eq!(hg(json!(label)), code, "{label}");
+    }
+    assert_eq!(hg(json!("Left Arm")), 4);
+    assert_eq!(hg(json!("HEAD")), 1);
+    assert_eq!(hg(json!(1)), 1);
+    assert_eq!(hg(json!("generic")), 0);
+    assert_eq!(hg(json!("totally-not-a-hitgroup")), 0);
+    assert_eq!(hitgroup_to_int(&None), 0);
+    assert_eq!(hg(Value::Null), 0);
+  }
+}

@@ -279,6 +279,8 @@ fn all_event_names() -> Vec<String> {
     "hegrenade_detonate", "flashbang_detonate",
     "player_hurt", "weapon_fire", "player_blind",
     "item_pickup", "buytime_ended",
+    // Event custom của parser (góc đạn thật đã gồm giật, inaccuracy, vị trí mắt) -- cho đạn đạo.
+    "fire_bullets",
   ].iter().map(|s| s.to_string()).collect()
 }
 fn all_event_player_fields() -> Vec<String> {
@@ -287,7 +289,13 @@ fn all_event_player_fields() -> Vec<String> {
     "team_num", "attacker_team_num", "user_team_num",
     "site", "user_X", "user_Y", "user_Z", "yaw",
     "pitch", "velocity_X", "velocity_Y",
-  ].iter().map(|s| s.to_string()).collect()
+  ]
+  .iter()
+  // Prop đạn đạo (shots_fired/duck_amount/is_scoped/is_airborne) gắn vào CHÍNH lượt event gộp -- rẻ
+  // hơn 1 lượt đọc demo riêng như bản TS.
+  .chain(parser::compute_ballistics::extra_event_player_fields().iter())
+  .map(|s| s.to_string())
+  .collect()
 }
 fn all_event_other_fields() -> Vec<String> {
   ["total_rounds_played", "round_start_time", "winner", "reason"].iter().map(|s| s.to_string()).collect()
@@ -327,6 +335,7 @@ pub struct FullPipelineOutput {
   json: Value,
   replay_chunks: Vec<ReplayChunkParsed>,
   replay_event_chunks: Vec<parser::compute_events::ReplayEventChunkOut>,
+  ballistics: parser::compute_ballistics::BallisticsOut,
 }
 
 // Extracted from FullPipelineTask::compute() so the resolve()-cost A/B bench below
@@ -369,6 +378,10 @@ fn run_full_pipeline_core(path: &str, zstd_level: i32, max_demo_ticks: i64) -> n
         Some(parser::compute_stats::KillsBatchItem { round_number, tick, data })
       })
       .collect();
+
+    // Đạn đạo: tick của mọi viên hợp lệ → gộp vào lượt tick (vị trí địch tại tick bắn).
+    let valid_rounds: std::collections::HashSet<i64> = events_result.rounds.iter().map(|r| r.round_number).collect();
+    let ballistic_ticks_set: AHashSet<i32> = parser::compute_ballistics::shot_ticks(&raw_events_arr, &valid_rounds).into_iter().collect();
 
     // weaponFireBatch/hurtBatch: giải nén + JSON.parse replayEventChunks (encode_replay_events_body
     // Rust y hệt encodeReplayEventsBody.ts -- JSON thô {tick,type,data}[], xem replay_event_chunks.rs).
@@ -428,14 +441,20 @@ fn run_full_pipeline_core(path: &str, zstd_level: i32, max_demo_ticks: i64) -> n
 
     let sampled_fields = sampled_tick_fields();
     let aim_fields = aim_tick_fields();
+    let ballistic_fields: Vec<String> = parser::compute_ballistics::tick_fields().iter().map(|s| s.to_string()).collect();
+    // Rank: controller prop đọc tại tick round_end cuối (computeRankStats của TS).
+    let rank_fields: Vec<String> = vec!["rank".to_string(), "comp_rank_type".to_string()];
+    let rank_ticks_set: AHashSet<i32> = [last_tick as i32].into_iter().collect();
     let mut union_fields = sampled_fields.clone();
-    for f in &aim_fields {
+    for f in aim_fields.iter().chain(&ballistic_fields).chain(&rank_fields) {
       if !union_fields.contains(f) {
         union_fields.push(f.clone());
       }
     }
     let mut union_ticks_set: AHashSet<i32> = sampled_ticks_set.clone();
     union_ticks_set.extend(aim_ticks_set.iter().copied());
+    union_ticks_set.extend(ballistic_ticks_set.iter().copied());
+    union_ticks_set.extend(rank_ticks_set.iter().copied());
     let union_ticks: Vec<i32> = union_ticks_set.into_iter().collect();
 
     // velocity_tick_filter = sampled cadence only: aim_tick_fields() never requests velocity, so
@@ -474,6 +493,33 @@ fn run_full_pipeline_core(path: &str, zstd_level: i32, max_demo_ticks: i64) -> n
     };
     let aim_tick_rows: Vec<parser::compute_aim::RawAimTickRow> = serde_json::from_value(aim_tick_rows_val).map_err(io_err)?;
 
+    let ballistics = {
+      let rows_val = if ballistic_ticks_set.is_empty() {
+        Value::Array(vec![])
+      } else {
+        extract_tick_view(&merged, &ballistic_fields, &ballistic_ticks_set, false)?
+      };
+      let rows = rows_val.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+      parser::compute_ballistics::compute_ballistics(&raw_events_arr, &valid_rounds, tickrate, rows, zstd_level)
+    };
+
+    // Rank (port computeRankStats): giữ player có rank > 0 và loại rank > 0.
+    let mut ranks: std::collections::HashMap<String, parser::compute_stats::PlayerRank> = std::collections::HashMap::new();
+    if let Value::Array(rows) = extract_tick_view(&merged, &rank_fields, &rank_ticks_set, false)? {
+      for r in rows {
+        let sid = match r.get("steamid") {
+          Some(Value::String(s)) => s.clone(),
+          Some(Value::Number(n)) => n.to_string(),
+          _ => continue,
+        };
+        let n = |k: &str| r.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as i64;
+        let (rank, rank_type) = (n("rank"), n("comp_rank_type"));
+        if !sid.is_empty() && rank > 0 && rank_type > 0 {
+          ranks.insert(sid, parser::compute_stats::PlayerRank { comp_rank: rank, comp_rank_type: rank_type });
+        }
+      }
+    }
+
     // 5) computeStats + computeAimStats.
     let raw_kills: Vec<parser::compute_stats::RawKillRow> = serde_json::from_value(Value::Array(raw_kills_arr)).map_err(io_err)?;
     let raw_hurt: Vec<parser::compute_stats::RawHurtRow> = serde_json::from_value(Value::Array(raw_hurt_arr)).map_err(io_err)?;
@@ -500,21 +546,28 @@ fn run_full_pipeline_core(path: &str, zstd_level: i32, max_demo_ticks: i64) -> n
       None
     };
 
+    // 7) Gộp trùng grain (db-redesign P1.5) → đúng shape ParsedMatch (packages/parse-core/src/types.ts).
+    // PlayerMatchStat = base + aim + accuracy + rank; RoundPlayerStat = survivor + economy + damage.
+    let round_player_stats = parser::compute_stats::merge_round_player_stats(
+      &stats_result.round_survivor_stats,
+      &stats_result.round_economy_stats,
+      &stats_result.round_player_damage_stats,
+    );
+    let player_match_stats =
+      parser::compute_stats::merge_player_match_stats(stats_result.player_match_stats, aim_result, stats_result.player_accuracy_stats, &ranks);
+
     let replay_event_chunks = std::mem::take(&mut events_result.replay_event_chunks);
     let json = serde_json::json!({
       "meta": { "map": map_name, "tickrate": tickrate, "duration": duration },
       "rounds": events_result.rounds,
       "events": events_result.events,
+      "playerMatchStats": player_match_stats,
       "matchWeaponStats": stats_result.match_weapon_stats,
-      "playerAccuracyStats": stats_result.player_accuracy_stats,
-      "playerMatchStats": stats_result.player_match_stats,
-      "roundSurvivorStats": stats_result.round_survivor_stats,
+      "playerWeaponStats": stats_result.player_weapon_stats,
       "playerZoneStats": stats_result.player_zone_stats,
-      "roundEconomyStats": stats_result.round_economy_stats,
-      "roundPlayerDamageStats": stats_result.round_player_damage_stats,
-      "playerAimStats": aim_result,
+      "roundPlayerStats": round_player_stats,
     });
-    Ok(FullPipelineOutput { json, replay_chunks, replay_event_chunks })
+    Ok(FullPipelineOutput { json, replay_chunks, replay_event_chunks, ballistics })
 }
 
 // Builds the 2 chunk arrays shared by both resolve() implementations below. Iterates BY VALUE
@@ -553,6 +606,17 @@ fn build_chunk_arrays(
   Ok((rc, ec))
 }
 
+// ParsedMatch.ballistics = { version, shotCount, data: Buffer (blob zstd), roundPlayer }.
+fn build_ballistics_object(env: Env, b: parser::compute_ballistics::BallisticsOut) -> napi::Result<JsObject> {
+  let mut o = env.create_object()?;
+  o.set("version", b.version)?;
+  o.set("shotCount", b.shot_count)?;
+  o.set("data", Buffer::from(b.data))?;
+  let round_player = serde_json::to_value(&b.round_player).map_err(io_err)?;
+  o.set("roundPlayer", env.to_js_value(&round_player)?)?;
+  Ok(o)
+}
+
 impl Task for FullPipelineTask {
   type Output = FullPipelineOutput;
   type JsValue = JsObject;
@@ -576,6 +640,7 @@ impl Task for FullPipelineTask {
     let (rc, ec) = build_chunk_arrays(env, output.replay_chunks, output.replay_event_chunks)?;
     obj.set("replayChunks", rc)?;
     obj.set("replayEventChunks", ec)?;
+    obj.set("ballistics", build_ballistics_object(env, output.ballistics)?)?;
     obj.set("__resolveMs", t0.elapsed().as_secs_f64() * 1000.0)?;
     Ok(obj)
   }
@@ -607,6 +672,7 @@ pub struct FullPipelineBufOutput {
   json_bytes: Vec<u8>,
   replay_chunks: Vec<ReplayChunkParsed>,
   replay_event_chunks: Vec<parser::compute_events::ReplayEventChunkOut>,
+  ballistics: parser::compute_ballistics::BallisticsOut,
 }
 
 pub struct FullPipelineBufTask {
@@ -625,7 +691,7 @@ impl Task for FullPipelineBufTask {
     // thread in resolve() -- this is the entire point of the A/B: move the "walk the whole value
     // tree" cost off the thread that gates parallelism.
     let json_bytes = serde_json::to_vec(&out.json).map_err(io_err)?;
-    Ok(FullPipelineBufOutput { json_bytes, replay_chunks: out.replay_chunks, replay_event_chunks: out.replay_event_chunks })
+    Ok(FullPipelineBufOutput { json_bytes, replay_chunks: out.replay_chunks, replay_event_chunks: out.replay_event_chunks, ballistics: out.ballistics })
   }
 
   // Main thread: wrap 1 Buffer (json bytes) + the chunk arrays -- no per-field FFI walk. Same
@@ -638,6 +704,7 @@ impl Task for FullPipelineBufTask {
     let (rc, ec) = build_chunk_arrays(env, output.replay_chunks, output.replay_event_chunks)?;
     obj.set("replayChunks", rc)?;
     obj.set("replayEventChunks", ec)?;
+    obj.set("ballistics", build_ballistics_object(env, output.ballistics)?)?;
     obj.set("__resolveMs", t0.elapsed().as_secs_f64() * 1000.0)?;
     Ok(obj)
   }
@@ -935,5 +1002,78 @@ mod events_playerinfo_fusion_parity {
 
     assert_eq!(legacy_events, merged_events, "game_events diverged after events+playerInfo fusion");
     assert_eq!(legacy_player_info, merged_player_info, "player_md diverged after events+playerInfo fusion");
+  }
+}
+
+// Đo `total_rounds_played` thô của round_start/round_end bằng CHÍNH parser Rust (TS và Rust từng ghi
+// chú mâu thuẫn nhau về +1). Chạy tay: PROBE_DEMO=/path/x.dem cargo test probe_round_trp -- --ignored --nocapture
+#[cfg(test)]
+mod round_trp_probe {
+  use super::*;
+
+  #[test]
+  #[ignore]
+  fn probe_round_trp() {
+    let path = std::env::var("PROBE_DEMO").expect("PROBE_DEMO");
+    let huf = create_huffman_lookup_table();
+    let names = vec!["round_start".to_string(), "round_end".to_string(), "player_death".to_string(), "fire_bullets".to_string()];
+    let mut fb_printed = false;
+    let (events, _) = run_parse_events_and_player_info(&path, &huf, names, vec![], all_event_other_fields()).unwrap();
+    let mut kills_per_trp: std::collections::BTreeMap<i64, i64> = Default::default();
+    for e in events.as_array().unwrap() {
+      let name = e["event_name"].as_str().unwrap_or("");
+      if name == "fire_bullets" {
+        if !fb_printed {
+          println!("fire_bullets sample: {e}");
+          fb_printed = true;
+        }
+        continue;
+      }
+      if name == "player_death" {
+        *kills_per_trp.entry(e["total_rounds_played"].as_i64().unwrap_or(-1)).or_default() += 1;
+        continue;
+      }
+      println!("{name:11} tick={:>7} trp={} winner={} reason={}", e["tick"], e["total_rounds_played"], e["winner"], e["reason"]);
+    }
+    println!("kills per trp: {kills_per_trp:?}");
+  }
+}
+
+// Dump ParsedMatch của Rust (json + ballistics đã giải nén) ra file để so parity với TS computeMatchData
+// trên máy khác (container build không có Node). Chạy tay:
+// PROBE_DEMO=/x.dem DUMP_OUT=/out.json cargo test --release dump_full_pipeline -- --ignored --nocapture
+#[cfg(test)]
+mod full_pipeline_dump {
+  use super::*;
+
+  #[test]
+  #[ignore]
+  fn dump_full_pipeline() {
+    let path = std::env::var("PROBE_DEMO").expect("PROBE_DEMO");
+    let out_path = std::env::var("DUMP_OUT").expect("DUMP_OUT");
+    let t0 = Instant::now();
+    let out = run_full_pipeline_core(&path, 3, i64::MAX).unwrap();
+    let ms = t0.elapsed().as_millis();
+    let shots: Value = if out.ballistics.data.is_empty() {
+      Value::Array(vec![])
+    } else {
+      serde_json::from_slice(&parser::zstd_codec::decompress(&out.ballistics.data).unwrap()).unwrap()
+    };
+    let mut events_by_type: std::collections::BTreeMap<String, i64> = Default::default();
+    for c in &out.replay_event_chunks {
+      let evs: Value = serde_json::from_slice(&parser::zstd_codec::decompress(&c.data).unwrap()).unwrap();
+      for e in evs.as_array().unwrap() {
+        *events_by_type.entry(e["type"].as_str().unwrap_or("").to_string()).or_default() += 1;
+      }
+    }
+    let dump = serde_json::json!({
+      "ms": ms,
+      "json": out.json,
+      "replayChunks": out.replay_chunks.len(),
+      "replayEventTypes": events_by_type,
+      "ballistics": { "version": out.ballistics.version, "shotCount": out.ballistics.shot_count, "roundPlayer": out.ballistics.round_player, "shots": shots },
+    });
+    std::fs::write(&out_path, serde_json::to_vec(&dump).unwrap()).unwrap();
+    println!("dumped {out_path} in {ms}ms");
   }
 }

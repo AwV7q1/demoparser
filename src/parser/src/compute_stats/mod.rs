@@ -11,6 +11,7 @@
 
 mod constants;
 mod damage_stats;
+mod merge;
 mod ordered_map;
 mod player_stats;
 mod tick_aggregates;
@@ -19,9 +20,11 @@ mod types;
 mod weapon_accuracy;
 
 pub use types::{
-  HurtBatchItem, KillsBatchItem, MatchWeaponStat, PlayerAccuracyStat, PlayerMatchStat, PlayerZoneStat, RawHurtRow, RawKillRow, RawPlayerInfo,
-  RoundDamageStat, RoundEconomyStat, RoundSurvivorStat, TickRow, WeaponFireBatchItem,
+  HurtBatchItem, KillsBatchItem, MatchWeaponStat, PlayerAccuracyStat, PlayerMatchStat, PlayerWeaponStat, PlayerZoneStat, RawHurtRow, RawKillRow,
+  RawPlayerInfo, RoundDamageStat, RoundEconomyStat, RoundSurvivorStat, TickRow, WeaponFireBatchItem,
 };
+// Bước gộp cuối (db-redesign P1.5) -- full_pipeline gọi sau khi có aim + rank.
+pub use merge::{merge_player_match_stats, merge_round_player_stats, MergedPlayerMatchStat, PlayerRank, RoundPlayerStat};
 // Reused by compute_aim (its `acc` map has the exact same "JS Map insertion order matters"
 // requirement -- see ordered_map.rs header comment).
 pub use ordered_map::OrderedMap;
@@ -33,6 +36,7 @@ use serde_json::Value;
 
 pub struct ComputeStatsResult {
   pub match_weapon_stats: Vec<MatchWeaponStat>,
+  pub player_weapon_stats: Vec<PlayerWeaponStat>,
   pub player_accuracy_stats: Vec<PlayerAccuracyStat>,
   pub player_match_stats: Vec<PlayerMatchStat>,
   pub round_survivor_stats: Vec<RoundSurvivorStat>,
@@ -71,13 +75,14 @@ pub fn compute_stats_rows(
   tick_rows: &[TickRow],
   rounds: &[ParsedRound],
 ) -> ComputeStatsResult {
-  let (match_weapon_stats, player_accuracy_stats) = weapon_accuracy::compute_weapon_accuracy_stats(kills_batch, weapon_fire_batch, hurt_batch);
+  let (match_weapon_stats, player_weapon_stats, player_accuracy_stats) = weapon_accuracy::compute_weapon_accuracy_stats(kills_batch, weapon_fire_batch, hurt_batch);
   let player_match_stats = player_stats::compute_player_stats(raw_kills, player_info, raw_hurt);
   let (round_survivor_stats, player_zone_stats, round_economy_stats) = tick_aggregates::compute_tick_aggregates(tick_rows, kills_batch, rounds);
   let round_player_damage_stats = damage_stats::compute_damage_stats(hurt_batch);
 
   ComputeStatsResult {
     match_weapon_stats,
+    player_weapon_stats,
     player_accuracy_stats,
     player_match_stats,
     round_survivor_stats,
