@@ -71,10 +71,10 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
   let item_pickup_events = by_event("item_pickup");
   let buytime_ended_events = by_event("buytime_ended");
 
-  // buildGrenadeTrajectoryIndex: filter x/y/z != null trước khi group (helpers.ts).
+  // Chỉ projectile có toạ độ (x/y/z != null) mới dựng được đường bay.
   let grenade_traj_rows: Vec<RawGrenadeSample> =
     grenade_rows.iter().filter(|r| r.x.is_some() && r.y.is_some() && r.z.is_some()).cloned().collect();
-  let grenade_traj = grenades::build_grenade_trajectory_index(&grenade_traj_rows);
+  let flights = grenades::build_projectile_flights(&grenade_traj_rows);
 
   let rr = rounds::compute_rounds(&round_start_events, &round_end_events);
 
@@ -101,9 +101,10 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
     &smoke_end_events,
     constants::SMOKE_FALLBACK_TICKS,
     &fire_shots,
-    &grenade_traj,
+    &flights,
     constants::smoke_fire_weapon(),
     constants::smoke_proj(),
+    grenades::FlightMatch::Entity,
     &rr.valid_rounds,
   );
   push_all(&mut events, &smokes);
@@ -114,9 +115,10 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
     &fire_end_events,
     constants::FIRE_FALLBACK_TICKS,
     &fire_shots,
-    &grenade_traj,
+    &flights,
     constants::fire_fire_weapon(),
     constants::fire_proj(),
+    grenades::FlightMatch::OwnerEnd,
     &rr.valid_rounds,
   );
   push_all(&mut events, &fires);
@@ -125,7 +127,7 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
     "HE_EXPLODE",
     &he_events,
     &fire_shots,
-    &grenade_traj,
+    &flights,
     constants::he_fire_weapon(),
     constants::he_proj(),
     &rr.valid_rounds,
@@ -136,7 +138,7 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
     "FLASH",
     &flash_events,
     &fire_shots,
-    &grenade_traj,
+    &flights,
     constants::flash_fire_weapon(),
     constants::flash_proj(),
     &rr.valid_rounds,

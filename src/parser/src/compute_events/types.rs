@@ -139,6 +139,10 @@ pub struct RawGrenadeSample {
   pub z: Option<f64>,
   #[serde(default)]
   pub grenade_type: Option<String>,
+  // Entity id của projectile -- khoá ghép quỹ đạo với *_detonate (event mang `entityid` = projectile).
+  // Id bị engine tái sử dụng giữa các quả, nên grenades.rs tách thành chuyến theo gap tick.
+  #[serde(default)]
+  pub grenade_entity_id: Option<i64>,
 }
 
 // ── Rounds ────────────────────────────────────────────────────────────────────
