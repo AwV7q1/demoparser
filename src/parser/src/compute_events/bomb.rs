@@ -68,11 +68,32 @@ struct SettledPos {
 
 // `Map<any, ...>` keyed theo object reference ở TS -- thay bằng index vào `bomb_dropped_events`
 // (mỗi drop event chỉ xuất hiện 1 lần trong mảng gốc, tương đương identity).
+//
+// GOTCHA: CS2 đôi khi KHÔNG bắn `bomb_pickup` khi nhặt lại C4 đồng đội vứt trong freeze time --
+// chỉ có `item_pickup` (item="c4") cùng lúc. Thiếu pickup thì drop bị ghép nhầm với pickup đầu
+// round SAU (toạ độ còn stale trước teleport, vd đứng ở site vừa gài) → replay vẽ C4 nằm sẵn ở
+// site suốt round. Nên: (1) bù pickup từ `item_pickup` c4 không có `bomb_pickup` cùng tick+người,
+// (2) chỉ ghép drop↔pickup khi cùng `total_rounds_played`.
 pub fn build_bomb_drop_pickup(
   bomb_dropped_events: &[RawEvent],
   bomb_pickup_events: &[RawEvent],
+  item_pickup_events: &[RawEvent],
   valid_rounds: &HashSet<i64>,
 ) -> (Vec<ParsedEvent<BombDroppedData>>, Vec<ParsedEvent<BombPickupData>>) {
+  // ----- START: gộp bomb_pickup + item_pickup c4 bị thiếu bomb_pickup -----
+  let have: HashSet<(i64, Option<&str>)> =
+    bomb_pickup_events.iter().map(|e| (e.tick.unwrap_or(0), e.user_steamid.as_deref())).collect();
+  let mut pickups_all: Vec<RawEvent> = bomb_pickup_events.to_vec();
+  for ev in item_pickup_events {
+    let is_c4 = ev.item.as_deref().map(|s| s.eq_ignore_ascii_case("c4")).unwrap_or(false);
+    if is_c4 && !have.contains(&(ev.tick.unwrap_or(0), ev.user_steamid.as_deref())) {
+      pickups_all.push(ev.clone());
+    }
+  }
+  pickups_all.sort_by_key(|e| e.tick.unwrap_or(0));
+  let bomb_pickup_events = &pickups_all[..];
+  // ----- END: gộp pickup -----
+
   enum Kind {
     Drop(usize),
     Pickup(usize),
@@ -93,7 +114,9 @@ pub fn build_bomb_drop_pickup(
     if let Kind::Drop(drop_idx) = chrono[i].1 {
       if let Some((_, Kind::Pickup(pickup_idx))) = chrono.get(i + 1) {
         let next = &bomb_pickup_events[*pickup_idx];
-        if let Some(ux) = next.user_x {
+        // Khác round → pickup đầu round sau (toạ độ stale), không phải chỗ bom rơi.
+        let same_round = next.total_rounds_played == bomb_dropped_events[drop_idx].total_rounds_played;
+        if let (true, Some(ux)) = (same_round, next.user_x) {
           settled.insert(drop_idx, SettledPos { x: ux, y: next.user_y, z: next.user_z });
         }
       }

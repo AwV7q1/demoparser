@@ -88,7 +88,7 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
   push_all(&mut events, &plants);
   push_all(&mut events, &defuses);
 
-  let (drops, pickups) = bomb::build_bomb_drop_pickup(&bomb_dropped_events, &bomb_pickup_events, &rr.valid_rounds);
+  let (drops, pickups) = bomb::build_bomb_drop_pickup(&bomb_dropped_events, &bomb_pickup_events, &item_pickup_events, &rr.valid_rounds);
   push_all(&mut events, &drops);
   push_all(&mut events, &pickups);
 
