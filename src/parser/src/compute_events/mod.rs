@@ -30,6 +30,8 @@ pub use types::{HurtData, KillData, WeaponFireData};
 // clean_name/side_or_null) -- see helpers.rs.
 pub use helpers::{clean_name, hitgroup_to_int, norm_weapon_name, side_2_else_ct, side_or_null};
 pub use constants::is_gun_weapon;
+// full_pipeline lọc MỌI event thô (cả nguồn stats/aim/ballistics đọc thẳng raw) theo mốc này.
+pub use rounds::match_start_tick;
 
 use replay_event_chunks::ReplayEventItem;
 use serde_json::Value;

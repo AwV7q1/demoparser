@@ -352,7 +352,17 @@ fn run_full_pipeline_core(path: &str, zstd_level: i32, max_demo_ticks: i64) -> n
     run_parse_events_and_player_info(path, &huf, all_event_names(), all_event_player_fields(), all_event_other_fields())?;
   let grenade_rows_val = run_parse_grenades(path, &huf)?;
 
-    let raw_events_arr = raw_events_val.as_array().cloned().unwrap_or_default();
+    // Bỏ event trước lúc trận thật bắt đầu (warmup/knife/restart huỷ) — xem rounds.rs match_start_tick.
+    // Lọc ở NGUỒN vì stats/aim/ballistics đọc raw_*_arr trực tiếp, không qua compute_events.
+    let events_all: Vec<parser::compute_events::RawEvent> =
+      serde::Deserialize::deserialize(&raw_events_val).map_err(io_err)?;
+    let match_start = parser::compute_events::match_start_tick(&events_all);
+    let events_in: Vec<parser::compute_events::RawEvent> =
+      events_all.into_iter().filter(|e| e.tick.map_or(true, |t| t >= match_start)).collect();
+    let raw_events_arr: Vec<Value> = raw_events_val
+      .as_array()
+      .map(|a| a.iter().filter(|e| e.get("tick").and_then(|v| v.as_i64()).map_or(true, |t| t >= match_start)).cloned().collect())
+      .unwrap_or_default();
     let raw_kills_arr: Vec<Value> = raw_events_arr
       .iter().filter(|e| e.get("event_name").and_then(|v| v.as_str()) == Some("player_death")).cloned().collect();
     let raw_hurt_arr: Vec<Value> = raw_events_arr
@@ -364,7 +374,7 @@ fn run_full_pipeline_core(path: &str, zstd_level: i32, max_demo_ticks: i64) -> n
       .collect();
 
     // 2) computeEvents (pure Rust, không qua N-API JSON round-trip -- deserialize thẳng Value đã có).
-    let events_in: Vec<parser::compute_events::RawEvent> = serde_json::from_value(raw_events_val).map_err(io_err)?;
+    drop(raw_events_val);
     let grenade_in: Vec<parser::compute_events::RawGrenadeSample> = serde_json::from_value(grenade_rows_val).map_err(io_err)?;
     let mut events_result = parser::compute_events::compute_events(&events_in, &grenade_in, zstd_level);
 
@@ -483,7 +493,10 @@ fn run_full_pipeline_core(path: &str, zstd_level: i32, max_demo_ticks: i64) -> n
       sorted_prop_infos.sort_by_key(|x| x.prop_name.clone());
       let helper = OutputSerdeHelperStruct { prop_infos: sorted_prop_infos, inner: tick_df.into() };
       let tick_data_val = serde_json::to_value(&helper).map_err(io_err)?;
-      parser::compute_stats::normalize_ticks(&tick_data_val)
+      let mut rows = parser::compute_stats::normalize_ticks(&tick_data_val);
+      // Zone stats quét MỌI tick row (không theo cửa sổ round) → bỏ vị trí warmup.
+      rows.retain(|t| t.tick >= match_start);
+      rows
     };
 
     let aim_tick_rows_val = if aim_ticks_set.is_empty() {

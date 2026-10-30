@@ -45,6 +45,30 @@ fn truthy(v: &Option<Value>) -> bool {
   }
 }
 
+fn is_real_round_end(re: &RawEvent) -> bool {
+  winner_side(&re.winner).is_some() && truthy(&re.reason)
+}
+
+// Tick trận thật bắt đầu = round_start trp=0 CUỐI CÙNG còn round_end thật phía sau (0 nếu không có).
+// Demo quay từ warmup có round_start trp=0 ở tick 0/1 + có khi 1 round_end giả lúc hết warmup (winner
+// CT, "time_ran_out", trp=1 — trùng số với round 1 thật nên round 1 thật bị lọc trùng mất), rồi
+// begin_new_match reset trp về 0. Event trước mốc này (warmup/knife/lần restart bị huỷ) phải bỏ hết:
+// gán round theo trp+1 nên chúng rơi vào round 1 (kill warmup vào stats, startTick=0 làm kinh tế round
+// 1 lấy đồ mua warmup). Đo 2026-10-30: spirit-vs-natus-vincere-m3-anubis round_start(1, trp=0) →
+// round_end(576, CT time_ran_out, trp=1) → round_start(1024, trp=0) + begin_new_match(1025) →
+// round_end(8399, bomb_defused, trp=1). Demo quay giữa trận không có round_start trp=0 → 0, không lọc.
+pub fn match_start_tick(events: &[RawEvent]) -> i64 {
+  let last_real_end = events.iter().filter(|e| e.event_name == "round_end" && is_real_round_end(e)).filter_map(|e| e.tick).max();
+  let Some(last_real_end) = last_real_end else { return 0 };
+  events
+    .iter()
+    .filter(|e| e.event_name == "round_start" && e.total_rounds_played == Some(0))
+    .filter_map(|e| e.tick)
+    .filter(|&t| t < last_real_end)
+    .max()
+    .unwrap_or(0)
+}
+
 pub fn compute_rounds(round_start_events: &[RawEvent], round_end_events: &[RawEvent]) -> RoundsResult {
   let mut round_start_tick_by_num: HashMap<i64, i64> = HashMap::new();
   for rs in round_start_events {
@@ -53,7 +77,7 @@ pub fn compute_rounds(round_start_events: &[RawEvent], round_end_events: &[RawEv
   }
 
   let mut sorted_round_ends: Vec<&RawEvent> =
-    round_end_events.iter().filter(|re| winner_side(&re.winner).is_some() && truthy(&re.reason)).collect();
+    round_end_events.iter().filter(|re| is_real_round_end(re)).collect();
   sorted_round_ends.sort_by_key(|e| e.tick.unwrap_or(0));
   let mut seen_round_nums: HashSet<i64> = HashSet::new();
   sorted_round_ends.retain(|re| seen_round_nums.insert(re.total_rounds_played.unwrap_or(0)));
@@ -129,6 +153,41 @@ mod tests {
     assert_eq!(r.rounds[1].start_tick, 15392, "round 2 ↔ round_start trp=1");
     assert_eq!(r.rounds[2].start_tick, 24329, "round 12 không có round_start trp=11 → lùi về end của round trước");
     assert_eq!(r.rounds[2].winner_side, "CT", "giữ round_end thật đầu tiên của số 12");
+  }
+
+  // Trích từ spirit-vs-natus-vincere-m3-anubis: warmup kết thúc bằng round_end thật-nhìn-như (có winner).
+  #[test]
+  fn match_start_skips_warmup_and_fake_round_end() {
+    let evs = vec![
+      ev("round_start", 1, 0, Value::Null, Value::Null),
+      ev("round_end", 576, 1, json!("CT"), json!("time_ran_out")),
+      ev("round_start", 1024, 0, Value::Null, Value::Null),
+      ev("round_end", 8399, 1, json!("CT"), json!("bomb_defused")),
+      ev("round_start", 8847, 1, Value::Null, Value::Null),
+      ev("round_end", 15250, 2, json!("CT"), json!("t_killed")),
+    ];
+    let ms = match_start_tick(&evs);
+    assert_eq!(ms, 1024);
+    let kept: Vec<RawEvent> = evs.into_iter().filter(|e| e.tick.unwrap_or(0) >= ms).collect();
+    let starts: Vec<RawEvent> = kept.iter().filter(|e| e.event_name == "round_start").cloned().collect();
+    let ends: Vec<RawEvent> = kept.iter().filter(|e| e.event_name == "round_end").cloned().collect();
+    let r = compute_rounds(&starts, &ends);
+    assert_eq!((r.rounds[0].start_tick, r.rounds[0].end_tick, r.rounds[0].reason.as_str()), (1024, 8399, "bomb_defused"));
+  }
+
+  #[test]
+  fn match_start_zero_for_mid_match_demo_or_trailing_reset() {
+    let mid = vec![
+      ev("round_start", 5, 4, Value::Null, Value::Null),
+      ev("round_end", 900, 5, json!("T"), json!("ct_killed")),
+    ];
+    assert_eq!(match_start_tick(&mid), 0, "không có round_start trp=0 → không lọc");
+    let trailing = vec![
+      ev("round_start", 100, 0, Value::Null, Value::Null),
+      ev("round_end", 900, 1, json!("T"), json!("ct_killed")),
+      ev("round_start", 1500, 0, Value::Null, Value::Null),
+    ];
+    assert_eq!(match_start_tick(&trailing), 100, "reset sau round cuối không được nuốt cả trận");
   }
 
   #[test]
