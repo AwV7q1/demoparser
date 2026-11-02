@@ -1,7 +1,8 @@
 // ADR-007 §VI.2 (cs2-analytics) "events" domain port -- orchestrator. Mirrors the "events"
 // section of computeMatchData() in packages/parse-core/src/compute.ts (L79-105): filter
 // all_events by event_name (byEvent), call each build_* in the SAME order, encode replay-event
-// chunks from [...weaponFireBatch, ...hurtBatch] only. "stats"/"aim" (computeWeaponAccuracyStats,
+// chunks from [...weaponFireBatch, ...hurtBatch] + BOMB_DROPPED/BOMB_PICKUP/WEAPON_PICKUP (chỉ replay
+// dùng, xem push_replay) + NADE_TRAJECTORY (đường bay lựu đạn, xem push_nades). "stats"/"aim" (computeWeaponAccuracyStats,
 // computePlayerStats, computeTickAggregates, computeDamageStats, computeAimStats) are OUT OF
 // SCOPE for this phase -- they stay in TS, see plan/ADR-007 §VI update.
 //
@@ -51,6 +52,48 @@ fn push_all<D: serde::Serialize>(events: &mut Vec<Value>, batch: &[ParsedEvent<D
   }
 }
 
+// Như push_all nhưng đẩy vào nguồn replay event chunk (blob zstd/round) thay vì `events` vĩnh viễn.
+fn push_replay<D: serde::Serialize>(items: &mut Vec<ReplayEventItem>, batch: &[ParsedEvent<D>]) {
+  for e in batch {
+    items.push(ReplayEventItem {
+      round_number: e.round_number,
+      tick: e.tick,
+      r#type: e.r#type.to_string(),
+      data: serde_json::to_value(&e.data).expect("ParsedEvent data serialize không bao giờ lỗi"),
+    });
+  }
+}
+
+// ----- START: push_nades — tách đường bay lựu đạn khỏi game_events -----
+// Như push_all nhưng gỡ `data.trajectory` (~80% byte JSON của SMOKE/FIRE/HE/FLASH, chỉ replay vẽ)
+// sang blob dạng NADE_TRAJECTORY {nadeType, thrownBy, trajectory}, cùng round/tick với event gốc.
+// FE (useRoundQueries) gắn lại vào event theo khoá type+tick+thrownBy. Event analytics (x/y/team/
+// thrownBy/throwerX...) giữ nguyên trong game_events.
+const NADE_TRAJECTORY: &str = "NADE_TRAJECTORY";
+
+fn push_nades<D: serde::Serialize>(events: &mut Vec<Value>, items: &mut Vec<ReplayEventItem>, batch: &[ParsedEvent<D>]) {
+  for e in batch {
+    let mut v = serde_json::to_value(e).expect("ParsedEvent serialize không bao giờ lỗi (không có key non-string/NaN)");
+    let data = v.get_mut("data").and_then(Value::as_object_mut);
+    if let Some(data) = data {
+      if let Some(trajectory) = data.remove("trajectory") {
+        items.push(ReplayEventItem {
+          round_number: e.round_number,
+          tick: e.tick,
+          r#type: NADE_TRAJECTORY.to_string(),
+          data: serde_json::json!({
+            "nadeType": e.r#type,
+            "thrownBy": data.get("thrownBy").cloned().unwrap_or(Value::Null),
+            "trajectory": trajectory,
+          }),
+        });
+      }
+    }
+    events.push(v);
+  }
+}
+// ----- END: push_nades -----
+
 pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample], zstd_level: i32) -> ComputeEventsResult {
   let by_event = |name: &str| -> Vec<RawEvent> { all_events.iter().filter(|e| e.event_name == name).cloned().collect() };
 
@@ -81,6 +124,8 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
   let rr = rounds::compute_rounds(&round_start_events, &round_end_events);
 
   let mut events: Vec<Value> = Vec::new();
+  // Event CHỈ replay dùng (không API/worker nào query) → blob ReplayEventChunk, không vào game_events.
+  let mut replay_items: Vec<ReplayEventItem> = Vec::new();
 
   let kills = kills::build_kills(&kill_events, &rr.valid_rounds);
   push_all(&mut events, &kills);
@@ -90,12 +135,18 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
   push_all(&mut events, &plants);
   push_all(&mut events, &defuses);
 
+  // ----- START: BOMB_DROPPED/BOMB_PICKUP/WEAPON_PICKUP → replay blob -----
+  // Chỉ FE replay đọc (useRoundEvents: icon C4 rơi/nhặt, ẩn icon súng rơi khi bị nhặt) và FE đã
+  // merge generic mọi type từ blob (useRoundQueries) → chuyển khỏi game_events không đổi API/FE.
+  // Trước đây 3 loại này chiếm ~64% số dòng game_events. Bị prune cùng replay khi hết retention.
   let (drops, pickups) = bomb::build_bomb_drop_pickup(&bomb_dropped_events, &bomb_pickup_events, &item_pickup_events, &rr.valid_rounds);
-  push_all(&mut events, &drops);
-  push_all(&mut events, &pickups);
+  push_replay(&mut replay_items, &drops);
+  push_replay(&mut replay_items, &pickups);
 
-  let weapon_pickups = bomb::build_weapon_pickup(&item_pickup_events, &buytime_ended_events, &rr.rounds);
-  push_all(&mut events, &weapon_pickups);
+  let kill_ticks: Vec<i64> = kills.iter().map(|k| k.tick).collect();
+  let weapon_pickups = bomb::build_weapon_pickup(&item_pickup_events, &buytime_ended_events, &kill_ticks, &rr.rounds);
+  push_replay(&mut replay_items, &weapon_pickups);
+  // ----- END: replay-only bomb/pickup -----
 
   let smokes = grenades::build_grenade_effects(
     "SMOKE",
@@ -109,7 +160,7 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
     grenades::FlightMatch::Entity,
     &rr.valid_rounds,
   );
-  push_all(&mut events, &smokes);
+  push_nades(&mut events, &mut replay_items, &smokes);
 
   let fires = grenades::build_grenade_effects(
     "FIRE",
@@ -123,7 +174,7 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
     grenades::FlightMatch::OwnerEnd,
     &rr.valid_rounds,
   );
-  push_all(&mut events, &fires);
+  push_nades(&mut events, &mut replay_items, &fires);
 
   let hes = grenades::build_instant_nade(
     "HE_EXPLODE",
@@ -134,7 +185,7 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
     constants::he_proj(),
     &rr.valid_rounds,
   );
-  push_all(&mut events, &hes);
+  push_nades(&mut events, &mut replay_items, &hes);
 
   let flashes = grenades::build_instant_nade(
     "FLASH",
@@ -145,7 +196,7 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
     constants::flash_proj(),
     &rr.valid_rounds,
   );
-  push_all(&mut events, &flashes);
+  push_nades(&mut events, &mut replay_items, &flashes);
 
   let burns = burn_blind::build_burn(&hurt_events, &rr.valid_rounds);
   push_all(&mut events, &burns);
@@ -158,24 +209,40 @@ pub fn compute_events(all_events: &[RawEvent], grenade_rows: &[RawGrenadeSample]
   let weapon_fire_batch = weapon_fire_hurt::build_weapon_fire(&fire_shots, &rr.valid_rounds);
   let hurt_batch = weapon_fire_hurt::build_hurt(&hurt_events, &rr.valid_rounds);
 
-  let mut replay_items: Vec<ReplayEventItem> = Vec::new();
-  for e in &weapon_fire_batch {
-    replay_items.push(ReplayEventItem {
-      round_number: e.round_number,
-      tick: e.tick,
-      r#type: e.r#type.to_string(),
-      data: serde_json::to_value(&e.data).expect("WeaponFireData serialize"),
-    });
-  }
-  for e in &hurt_batch {
-    replay_items.push(ReplayEventItem {
-      round_number: e.round_number,
-      tick: e.tick,
-      r#type: e.r#type.to_string(),
-      data: serde_json::to_value(&e.data).expect("HurtData serialize"),
-    });
-  }
+  push_replay(&mut replay_items, &weapon_fire_batch);
+  push_replay(&mut replay_items, &hurt_batch);
   let replay_event_chunks = replay_event_chunks::build_replay_event_chunks(replay_items, zstd_level);
 
   ComputeEventsResult { rounds: rr.rounds, events, replay_event_chunks }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[derive(serde::Serialize)]
+  #[serde(rename_all = "camelCase")]
+  struct Nade {
+    x: f64,
+    thrown_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trajectory: Option<Vec<[i64; 2]>>,
+  }
+
+  #[test]
+  fn push_nades_moves_trajectory_to_replay_items() {
+    let batch = vec![
+      ParsedEvent { round_number: 3, tick: 500, r#type: "SMOKE", data: Nade { x: 1.5, thrown_by: Some("a".into()), trajectory: Some(vec![[400, 1], [500, 2]]) } },
+      ParsedEvent { round_number: 3, tick: 600, r#type: "SMOKE", data: Nade { x: 2.5, thrown_by: Some("b".into()), trajectory: None } },
+    ];
+    let (mut events, mut items) = (Vec::new(), Vec::new());
+    push_nades(&mut events, &mut items, &batch);
+
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|e| e["data"].get("trajectory").is_none()));
+    assert_eq!(events[0]["data"]["x"], 1.5);
+    assert_eq!(items.len(), 1);
+    assert_eq!((items[0].round_number, items[0].tick, items[0].r#type.as_str()), (3, 500, NADE_TRAJECTORY));
+    assert_eq!(items[0].data, serde_json::json!({ "nadeType": "SMOKE", "thrownBy": "a", "trajectory": [[400, 1], [500, 2]] }));
+  }
 }

@@ -15,7 +15,8 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 // v2: "viên đầu"/"spray" chỉ tính súng tự động (is_auto_weapon) -- v1 gộp cả AWP/súng lục/shotgun.
-pub const BALLISTICS_VERSION: i64 = 2;
+// v3: `tgt` = hướng từ mắt tới đầu địch tại tick bắn -- web vẽ địch đúng chỗ thay cho thước đo cố định.
+pub const BALLISTICS_VERSION: i64 = 3;
 const HIT_MAX_GAP_TICKS: i64 = 2;
 const BURST_GAP_SEC: f64 = 0.5;
 const TARGET_MAX_DEG: f64 = 20.0;
@@ -125,6 +126,16 @@ fn angle_to(pitch_deg: f64, yaw_deg: f64, from: [f64; 3], to: [f64; 3]) -> Optio
   Some(dot.clamp(-1.0, 1.0).acos().to_degrees())
 }
 
+// Góc nhìn [pitch, yaw] (độ) từ `from` tới `to`, cùng quy ước angle_to: pitch dương = nhìn xuống.
+fn angles_to(from: [f64; 3], to: [f64; 3]) -> Option<[f64; 2]> {
+  let (dx, dy, dz) = (to[0] - from[0], to[1] - from[1], to[2] - from[2]);
+  let flat = (dx * dx + dy * dy).sqrt();
+  if flat < 1.0 && dz.abs() < 1.0 {
+    return None;
+  }
+  Some([(-dz).atan2(flat).to_degrees(), dy.atan2(dx).to_degrees()])
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ShotHit {
   pub victim: String,
@@ -153,6 +164,8 @@ pub struct ShotRow {
   pub air: bool,
   pub hits: Vec<ShotHit>,
   pub target: Option<String>,
+  /// [pitch, yaw] từ mắt tới đầu mục tiêu tại tick bắn (vị trí server, chưa tính lag compensation).
+  pub tgt: Option<[f64; 2]>,
   pub err: Option<f64>,
   pub dist: Option<i64>,
   pub kill: bool,
@@ -288,6 +301,7 @@ pub fn compute_ballistics(raw_events: &[Value], valid_rounds: &HashSet<i64>, tic
         air: ev.get("user_is_airborne").and_then(|v| v.as_bool()) == Some(true),
         hits: vec![],
         target: None,
+        tgt: None,
         err: None,
         dist: None,
         kill: false,
@@ -405,6 +419,7 @@ pub fn compute_ballistics(raw_events: &[Value], valid_rounds: &HashSet<i64>, tic
     }
     if let Some((p, err)) = best {
       s.row.err = Some(r2(err));
+      s.row.tgt = angles_to(s.row.eye, [p.p[0], p.p[1], p.p[2] + HEAD_Z - p.duck * DUCK_DROP]).map(|[a, b]| [r2(a), r2(b)]);
       let (dx, dy, dz) = (p.p[0] - s.row.eye[0], p.p[1] - s.row.eye[1], p.p[2] + CHEST_Z - s.row.eye[2]);
       s.row.dist = Some(js_round((dx * dx + dy * dy + dz * dz).sqrt()) as i64);
     }
@@ -548,6 +563,8 @@ mod tests {
     assert_eq!(v[1]["data"]["burst"], 1, "viên 2 cùng loạt");
     assert_eq!(v[2]["data"]["burst"], 2, "nghỉ > 0.5s = loạt mới");
     assert_eq!(v[1]["data"]["hits"][0]["victim"], "B");
+    assert_eq!(v[0]["data"]["tgt"], json!([0.0, 0.0]), "đầu B nằm thẳng trước mắt");
+    assert!(v[1]["data"]["tgt"].is_null(), "tick 108 không có vị trí B");
     assert_eq!(v[0]["data"]["steamId"], "A");
   }
 
@@ -570,6 +587,6 @@ mod tests {
     assert_eq!(a.shots, 4);
     assert_eq!(a.first_shots, 1, "chỉ AK idx 0, AWP không tính");
     assert_eq!(a.spray_shots, 1, "chỉ Negev idx 5, Deagle không tính");
-    assert_eq!(out.version, 2);
+    assert_eq!(out.version, 3);
   }
 }

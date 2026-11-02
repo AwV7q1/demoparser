@@ -188,9 +188,16 @@ fn find_round_idx(ranges: &[&ParsedRound], tick: i64) -> Option<usize> {
 // làm buytime_ended của warmup lẫn vào round 1. Dùng binary-search theo TICK RANGE thật của từng
 // round instance (giống buildReplayChunks) thay vì số round. `buytime_ended` cũng có thể bắn
 // nhiều lần trong CÙNG 1 round -- lấy mốc CUỐI CÙNG (không phải đầu tiên) làm cutoff.
+//
+// `kill_ticks`: tick mọi KILL hợp lệ. Lọc thứ 2 (chính): bỏ mọi pickup TRƯỚC kill đầu tiên của
+// round. Đo trên 10 trận thật, lọc buytime_ended gần như không ăn (~80% pickup còn lại là đồ
+// mua/spawn: nade, glock, hkp2000 trong 20s đầu round). Consumer duy nhất (FE useRoundEvents)
+// chỉ ghép pickup với vũ khí RƠI TỪ KILL (`p.tick >= dropTick`) → pickup trước kill đầu không bao
+// giờ khớp được gì, bỏ không mất thông tin.
 pub fn build_weapon_pickup(
   item_pickup_events: &[RawEvent],
   buytime_ended_events: &[RawEvent],
+  kill_ticks: &[i64],
   rounds: &[ParsedRound],
 ) -> Vec<ParsedEvent<WeaponPickupData>> {
   if rounds.is_empty() {
@@ -209,6 +216,17 @@ pub fn build_weapon_pickup(
     }
   }
 
+  // ----- START: tick KILL đầu tiên theo từng round instance (cùng cách bucket theo tick range) -----
+  let mut first_kill_by_round: HashMap<usize, i64> = HashMap::new();
+  for &tick in kill_ticks {
+    let Some(idx) = find_round_idx(&ranges, tick) else { continue };
+    let e = first_kill_by_round.entry(idx).or_insert(tick);
+    if tick < *e {
+      *e = tick;
+    }
+  }
+  // ----- END: tick KILL đầu tiên -----
+
   let pickup_exclude = super::constants::pickup_exclude();
   let mut out = Vec::new();
   for ev in item_pickup_events {
@@ -226,6 +244,11 @@ pub fn build_weapon_pickup(
         continue; // trong giờ mua → không phải nhặt thật
       }
     }
+    // Round chưa có kill (hoặc pickup trước kill đầu) → chưa có vũ khí nào rơi từ KILL để nhặt.
+    match first_kill_by_round.get(&idx) {
+      Some(first_kill) if tick >= *first_kill => {}
+      _ => continue,
+    }
     let r = ranges[idx];
     let data = WeaponPickupData {
       x: ev.user_x.unwrap(),
@@ -238,4 +261,43 @@ pub fn build_weapon_pickup(
     out.push(ParsedEvent { round_number: r.round_number, tick, r#type: "WEAPON_PICKUP", data });
   }
   out
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn round(n: i64, start: i64, end: i64) -> ParsedRound {
+    ParsedRound { round_number: n, winner_side: "CT".into(), reason: String::new(), t_score: 0, ct_score: 0, start_tick: start, end_tick: end }
+  }
+
+  fn pickup(tick: i64, item: &str) -> RawEvent {
+    RawEvent {
+      event_name: "item_pickup".to_string(),
+      tick: Some(tick),
+      item: Some(item.to_string()),
+      user_x: Some(0.0),
+      user_y: Some(0.0),
+      user_steamid: Some("765".to_string()),
+      ..Default::default()
+    }
+  }
+
+  // Pickup trước kill đầu tiên của round (đồ mua/spawn) bị bỏ; sau kill thì giữ; round không có
+  // kill thì bỏ hết. Bucket theo tick range nên kill round 1 không mở khoá pickup round 2.
+  #[test]
+  fn weapon_pickup_only_after_first_kill_of_round() {
+    let rounds = vec![round(1, 0, 1000), round(2, 1001, 2000), round(3, 2001, 3000)];
+    let pickups = vec![
+      pickup(100, "flashbang"), // round 1, trước kill đầu (500)
+      pickup(500, "ak47"),      // round 1, cùng tick kill → giữ
+      pickup(800, "awp"),       // round 1, sau kill → giữ
+      pickup(1200, "glock"),    // round 2, trước kill đầu (1500)
+      pickup(1600, "m4a1"),     // round 2, sau kill → giữ
+      pickup(2500, "deagle"),   // round 3 không có kill → bỏ
+    ];
+    let out = build_weapon_pickup(&pickups, &[], &[700, 500, 1500], &rounds);
+    let got: Vec<(i64, i64)> = out.iter().map(|e| (e.round_number, e.tick)).collect();
+    assert_eq!(got, vec![(1, 500), (1, 800), (2, 1600)]);
+  }
 }
